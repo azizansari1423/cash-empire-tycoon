@@ -1,8 +1,8 @@
-# Phase 1 Architecture — Cash Empire Tycoon (Revision 12)
+# Phase 1 Architecture — Cash Empire Tycoon (Revision 13)
 
 **Date:** 2026-11-25
 **Scope:** `PlayerDataManager.lua` session locking design
-**Status:** Revision 12 — pending approval before implementation
+**Status:** Revision 13 — pending approval before implementation
 
 ---
 
@@ -115,8 +115,8 @@ session loss   disconnectPlayer called
 
 **Cleanup:** Cleanup ownership differs by path:
 
-- **Normal and save-failed paths:** `disconnectPlayer` step 7 clears all per-player state tables to nil: `playerState`, `loadedData`, `sessionTokens`, `activeLocks`, `lastRefresh`, `inFlightSaves`, `shuttingDown`.
-- **Drain-timeout path:** `disconnectPlayer` clears `loadedData`, `activeLocks`, and `shuttingDown`, then exits with `playerState = "abandoned"` while in-flight autosaves remain. The final cleanup of `sessionTokens`, `inFlightSaves`, and `playerState` is deferred to `§6.3 Step 4`, which fires from the save-completion handler after the last autosave completes and `inFlightSaves` reaches 0.
+- **Normal and save-failed paths:** `disconnectPlayer` step 7 clears all per-player state tables to nil: `playerState`, `loadedData`, `sessionTokens`, `activeLocks`, `lastRefresh`, `inFlightSaves`, `shuttingDown`, `invalidated`.
+- **Drain-timeout path:** `disconnectPlayer` clears `loadedData`, `invalidated`, `lastRefresh`, `activeLocks`, and `shuttingDown`, then exits with `playerState = "abandoned"` while in-flight autosaves remain. The final cleanup of `sessionTokens`, `inFlightSaves`, and `playerState` is deferred to `§6.3 Step 4`, which fires from the save-completion handler after the last autosave completes and `inFlightSaves` reaches 0.
 
 `sessionTokens[userId]` is cleared in step 7 (normal and save-failed paths) or by §6.3 (drain-timeout path). It is **not** cleared in step 2 — doing so early would prevent §6.3's dual identity check from verifying which session's save is completing in the drain-timeout path (see D-20).
 
