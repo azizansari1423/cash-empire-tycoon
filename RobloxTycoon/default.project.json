@@ -1,0 +1,57 @@
+{
+  "name": "CashEmpireTycoon",
+  "tree": {
+    "$className": "DataModel",
+
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "MapBuilder": {
+        "$path": "src/ServerScripts/MapBuilder.server.lua"
+      },
+      "TycoonManager": {
+        "$path": "src/ServerScripts/TycoonManager.server.lua"
+      },
+      "LeaderboardServer": {
+        "$path": "src/ServerScripts/LeaderboardServer.server.lua"
+      },
+      "VehicleSystem": {
+        "$path": "src/ServerScripts/VehicleSystem.server.lua"
+      }
+    },
+
+    "ServerStorage": {
+      "$className": "ServerStorage",
+      "UpgradeTable": {
+        "$path": "src/ModuleScripts/UpgradeTable.lua"
+      },
+      "PlayerDataManager": {
+        "$path": "src/ServerScripts/PlayerDataManager.lua"
+      },
+      "ShopHandler": {
+        "$path": "src/ServerScripts/ShopHandler.lua"
+      },
+      "DropperSystem": {
+        "$path": "src/ServerScripts/DropperSystem.lua"
+      }
+    },
+
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "HUD": {
+          "$path": "src/LocalScripts/HUD.client.lua"
+        },
+        "ConveyorVisuals": {
+          "$path": "src/LocalScripts/ConveyorVisuals.client.lua"
+        },
+        "SoundManager": {
+          "$path": "src/LocalScripts/SoundManager.client.lua"
+        },
+        "PlaytimeGifts": {
+          "$path": "src/LocalScripts/PlaytimeGifts.client.lua"
+        }
+      }
+    }
+  }
+}

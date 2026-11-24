@@ -1,0 +1,12 @@
+# Roblox place files
+/Umar.rbxlx
+*.rbxlx.lock
+*.rbxl.lock
+*.rbxl
+sourcemap.json
+
+# Other projects / scratch files in this workspace
+ZombieWaveTycoon/
+/src/
+check.txt
+first_code.py
