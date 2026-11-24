@@ -1,9 +1,9 @@
-# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 3)
+# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 6)
 
 **Date:** 2026-11-24
 **Branch:** `feature/phase-1-data-foundation` (commit b05aa20)
 **Review branch:** `claude-review/phase-1`
-**Status:** Revision 5 — pending approval before implementation
+**Status:** Revision 6 — pending approval before implementation
 
 ---
 
@@ -117,7 +117,7 @@ There is no formal state machine governing player data lifecycle. This creates s
 | R4 | The save callback returns nil if `current._session.token ~= token`. Confirmed session loss in savePlayer transitions state to "invalidated" and kicks the player without retry. DataStore errors are retried up to SAVE_RETRIES times. | D-2 | §6 |
 | R5 | `invalidated[userId]` is set on initial load failure, confirmed save session loss, confirmed refresh session loss, and persistent refresh failure (elapsed > LOCK_TTL). `getData` checks `invalidated[userId]` and returns nil if set. | D-4 | §9 |
 | R6 | The refresh callback verifies `current._session.token == sessionTokens[userId]` and returns nil on mismatch. A nil result transitions state to "invalidated" and kicks the player. | D-5 | §7 |
-| R7 | `playerState[userId]` state machine governs all per-player operations. `addCash`/`spendCash` require state "active". `savePlayer` requires state "active"/"releasing". `releaseSession` transitions "active"→"releasing"; concurrent second call is a no-op. | Arch issue | §4 |
+| R7 | `playerState[userId]` state machine governs all per-player operations. `addCash`/`spendCash` require state "active". `savePlayer` (autosave path) requires state "active" only — rejects "disconnecting" and all other states. `disconnectSave` requires state "disconnecting" (called only from `disconnectPlayer`). The "releasing" state does not exist in the current design; it was removed in Revision 5. | Arch issue | §4, §6.1, §6.5 |
 | R8 | A concurrent second `loadPlayer` call for the same player (state "loading" or non-nil) is rejected immediately with a warning. It does not acquire, overwrite, or modify any existing session. | Arch issue | §5.1 |
 | R9 | A same-server session in the acquisition callback is treated as an idempotent retry **only** when `current._session.token == token`. If `current._session.jobId == JOB_ID` but `current._session.token ~= token`, the callback returns nil (another invocation on this server holds the session). | Arch issue (Issue 2) | §5.3 |
 | R10 | `_session` metadata is never present in `loadedData[userId]` or in the value returned by `getData`. It is stripped at load time and reconstructed from `current._session` inside the save callback. | Existing requirement | §2, §5.6, §6.2 |
@@ -260,3 +260,47 @@ The actual risks of allowing a late save were: (a) stale snapshot overwrites new
 | D-11 — cleanup cleared in-flight counter | `inFlightSaves[userId]=nil` cleared unconditionally in cleanup, even with in-flight autosave | Only clear `inFlightSaves` after confirmed 0 (normal path) or after deliberate give-up (save-deadline path) |
 | D-12 — competing saves from both callers | Both PlayerRemoving and BindToClose could independently call `savePlayer`, creating overlapping saves | `disconnectPlayer` with `shuttingDown[userId]` single-owner guard; second caller is a no-op |
 | D-13 — IW-1 inaccurate risk description | Claimed late save would write `released=false`; callback actually copies `current._session` preserving `released=true` | Corrected IW-1 to describe actual risks: stale snapshot, delayed acquisition by other servers |
+
+---
+
+## Defects Found in Revision 5 Architecture (fb02581)
+
+### D-14: `savePlayer` guards reject the disconnect save (CRITICAL)
+
+**File:** `PlayerDataManager.lua` (design)
+
+In Revision 5 §6.1, `savePlayer` accepted state `"active"` or `"releasing"`. In §10.1, `disconnectPlayer` set state to `"disconnecting"` and cleared `sessionTokens[userId]` before calling `savePlayer(player)`. This caused both guards to reject the call:
+
+1. **State guard:** `playerState[userId] == "disconnecting"` — not `"active"` or `"releasing"` → `return false`
+2. **Token guard:** `sessionTokens[userId] == nil` → `return false`
+
+The result: the final disconnect save was silently skipped. All normal-path timelines (Timelines A and B in §10.4) claiming a successful final save were invalid. Data written since the last autosave would be lost, and no `releaseSession` call would be issued because `savePlayer` returned false before `disconnectPlayer` reached that step.
+
+**Additional issue:** The `"releasing"` state referenced in the §6.1 guard and §9.2 guard does not exist in the Revision 5 state machine. It was replaced by `"disconnecting"` in Revision 5 but the guards were not updated. This meant even a hypothetical correct path could not use the "releasing" state, which was no longer defined.
+
+**Fix:** Introduce `disconnectSave(userId, player, token, snapshot)` as a new internal function that:
+- Accepts only `"disconnecting"` state (checked explicitly)
+- Uses explicitly passed `token` and `snapshot` (not read from shared state tables)
+- May only be called from `disconnectPlayer` after drain completes
+- Uses the same UpdateAsync callback structure as `savePlayer`
+- Returns `true` on success; on confirmed session loss, sets state to `"abandoned"` and returns `false`
+
+`disconnectPlayer` calls `disconnectSave(userId, player, token, snapshot)` instead of `savePlayer(player)`. The snapshot is taken after the drain completes. The token is the value captured from `sessionTokens` before it was cleared. `savePlayer` is updated to accept `"active"` state only (removing the now-removed `"releasing"` reference). See architecture §6.5 and §10.1 (Revision 6).
+
+---
+
+## Revised Requirements (additions)
+
+| ID | Requirement | Source defect | Architecture section |
+|---|---|---|---|
+| R21 | `disconnectSave(userId, player, token, snapshot)` is an internal function called only from `disconnectPlayer`, only in `"disconnecting"` state, only after `inFlightSaves[userId] == 0` is confirmed by drain. It uses explicitly passed `token` and `snapshot` (not `sessionTokens` or `loadedData`). It is the only save operation permitted in `"disconnecting"` state. Regular autosaves (`savePlayer`) reject `"disconnecting"` immediately via the state guard in §6.1. | D-14 | §6.5, §10.1 |
+
+---
+
+## Summary of Changes from Revision 5 (fb02581)
+
+| Issue | Revision 5 problem | Revision 6 fix |
+|---|---|---|
+| D-14 — savePlayer rejects disconnect save | `disconnectPlayer` set state→"disconnecting" and cleared `sessionTokens` before calling `savePlayer`; both guards rejected it → no save, no release | `disconnectSave(userId, player, token, snapshot)` accepts "disconnecting" state and uses explicit token+snapshot; `disconnectPlayer` calls it after drain with captured token and post-drain snapshot |
+| "releasing" state references | §6.1 and §9.2 guards referenced non-existent "releasing" state; also R7 described it as valid | Removed all "releasing" references; `savePlayer` accepts "active" only; `getData` checks "active" only; R7 updated |
+| In-flight refresh TTL extension | Abandoned-path timelines described TTL countdown starting from activeLocks clear | Documented in §7.5 and Risk 8: TTL countdown starts from last `_session.since` DataStore write, which may be later than activeLocks clear if a refresh was in-flight when disconnect began |

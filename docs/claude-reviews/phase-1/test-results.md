@@ -1,8 +1,8 @@
-# Phase 1 Test Results — Cash Empire Tycoon (Revision 3)
+# Phase 1 Test Results — Cash Empire Tycoon (Revision 6)
 
 **Date:** 2026-11-24
 **Commit under review:** b05aa20 (`feature/phase-1-data-foundation`)
-**Review revision:** 5
+**Review revision:** 6
 **Status:** Test plan revised — runtime tests not yet executed
 
 > **Note:** All test results in this document are design-level analysis. No runtime tests have been executed. Test scenarios marked PASS/FAIL reflect whether the revised design is expected to handle them correctly, not observed runtime behaviour.
@@ -19,7 +19,7 @@
 | Session lock prevents duplicate writes | Save callback: `current._session.token ~= token` → return nil → no write | Yes |
 | Stale lock (TTL expired) allows new server to acquire | Acquisition callback: `(now - sess.since) >= LOCK_TTL` → available for acquisition | Yes |
 | `addCash`/`spendCash` blocked after session loss | `invalidated[userId]=true` → `getData` returns nil → operations return false/nil | Yes |
-| `releaseSession` called twice is a no-op | State "releasing"/"released" → `releaseSession` returns without action | Yes |
+| Duplicate disconnect ownership rejected | `shuttingDown[userId]` guard: second caller (PlayerRemoving or BindToClose) returns immediately without any DataStore call | Yes |
 | BindToClose completes within 25 s deadline | Parallel saves with `task.wait(0.1)` poll; deadline enforced | Yes |
 | Legacy records (no `_session`) load correctly | Acquisition callback: `current._session == nil` → treated as available; all existing fields preserved | Yes |
 | `_session` never in `getData` return value | `loadedData[userId]` populated without `_session` at load time; `getData` returns that table | Yes |
@@ -141,13 +141,20 @@ Step 1:   addCash(X, 100) → getData(X) → invalidated[X]=true → return nil 
 Expected: No mutation. DESIGN: PASS
 ```
 
-**Scenario ML-3: `getData` called in state "releasing" (valid — PlayerRemoving path)**
+**Scenario ML-3: `getData` called in state "disconnecting" (blocked)**
+
+The "releasing" state was removed in Revision 5; the lifecycle transition is "active" → "disconnecting". `getData` accepts "active" only.
 
 ```
-Setup:    PlayerRemoving fires; releaseSession transitions to "releasing".
-          Some code calls getData during release (e.g., a final balance check).
-Step 1:   getData: playerState[X] == "releasing" → allowed → returns loadedData[X].
-Expected: getData returns valid data during graceful release path. DESIGN: PASS
+Setup:    PlayerRemoving fires; disconnectPlayer sets state→"disconnecting".
+          Some code calls getData (e.g., a final balance check or income tick).
+Step 1:   getData: playerState[X] == "disconnecting" ≠ "active" → return nil.
+Step 2:   addCash/spendCash → getData returns nil → no-op / return false. PASS
+Expected: getData is blocked during disconnect lifecycle. Game logic cannot mutate data
+          while disconnectPlayer owns the lifecycle.
+Note:     disconnectSave reads loadedData directly (via the snapshot parameter from
+          disconnectPlayer), not through getData. This block does not affect the save path.
+DESIGN: PASS
 ```
 
 ---
@@ -268,21 +275,23 @@ Step 5:   No refresh fires (activeLocks cleared at step 1). After LOCK_TTL secon
 Expected: Session expires by TTL. Autosave snapshot preserved. No cleanup race. DESIGN: PASS
 ```
 
-**Scenario IW-3: disconnectPlayer — save deadline exceeded (TTL path)**
+**Scenario IW-3: disconnectPlayer — disconnectSave all retries exhausted (TTL path)**
+
+`disconnectSave` handles its own retries internally. When all retries are exhausted, it sets `inFlightSaves[userId] = 0` (always decremented), sets state to "disconnecting" (unchanged — disconnectPlayer checks return value and transitions to "abandoned"), and returns `false`. There is no external wait loop.
 
 ```
-Setup:    Drain passes (inFlightSaves[X]=0). disconnectPlayer starts disconnect save.
-          savePlayer(X): inFlightSaves[X]=1; UpdateAsync stalls.
-Step 1:   SAVE_DEADLINE (~12s) exceeded; inFlightSaves[X] still 1.
-Step 2:   state→"abandoned"; inFlightSaves[X]=nil (deliberate give-up — warning issued).
-          loadedData[X]=nil; shuttingDown[X]=nil. No release UpdateAsync.
-Step 3:   Stuck UpdateAsync eventually resolves (or DataStore rejects it).
-          Callback: inFlightSaves decrement now operates on nil → potential nil error.
-          This is the acknowledged risk of the give-up path.
-Step 4:   Session expires by TTL.
-Expected: Degraded path; potential nil-decrement after give-up. Requires implementation
-          care (e.g., nil-safe decrement: inFlightSaves[X] = math.max(0, (inFlightSaves[X] or 1)-1)).
-DESIGN: PASS with implementation note (nil-safe decrement required).
+Setup:    Drain passes (inFlightSaves[X]=0). disconnectPlayer calls disconnectSave.
+          disconnectSave: inFlightSaves[X]=1; UpdateAsync stalls. All SAVE_RETRIES fail.
+Step 1:   disconnectSave: all attempts return !ok (DataStore error).
+Step 2:   disconnectSave: inFlightSaves[X]=0 (unconditional decrement). return false.
+Step 3:   disconnectPlayer: saveOk==false; playerState[X] not "abandoned" → set "abandoned".
+          loadedData[X]=nil; inFlightSaves[X]=nil (already 0 — cleanup); shuttingDown[X]=nil.
+          No release UpdateAsync.
+Step 4:   Session expires by TTL (LOCK_TTL seconds from last _session.since write in DataStore,
+          see §7.5 for in-flight refresh note).
+Expected: inFlightSaves is 0 when disconnectPlayer cleans up (no nil-decrement risk).
+          inFlightSaves cleared safely since disconnectSave already decremented to 0.
+DESIGN: PASS
 ```
 
 ### Single-Owner Disconnect and Save Serialization (NEW — Revision 5, D-12)
@@ -328,10 +337,10 @@ Setup:    Autosave captures snapshot_T0={Cash:100}. addCash(50) runs: loadedData
 Step 1:   disconnectPlayer(X): drain wait; inFlightSaves[X]==1 > 0 → loops.
 Step 2:   Autosave UpdateAsync completes; inFlightSaves[X]=0.
           DataStore: {Cash:100, _session:{T_A}}.
-Step 3:   Drain passes. disconnectPlayer takes disconnect snapshot_T1=deepCopy(loadedData[X])={Cash:150}.
-Step 4:   savePlayer(X) starts; inFlightSaves[X]=1; UpdateAsync with snapshot_T1.
-Step 5:   Disconnect save completes: DataStore={Cash:150, _session:{T_A}} ✅
-          inFlightSaves[X]=0.
+Step 3:   Drain passes. disconnectPlayer takes snapshot_T1=deepCopy(loadedData[X])={Cash:150}.
+Step 4:   disconnectSave(X, player, T_A, snapshot_T1); inFlightSaves[X]=1; UpdateAsync.
+Step 5:   Disconnect save completes: result._session.token==T_A → ✅
+          inFlightSaves[X]=0; return true. DataStore={Cash:150, _session:{T_A}}.
 Step 6:   releaseSession → released=true. DataStore={Cash:150, _session:{T_A, released:true}} ✅
 Expected: Final DataStore value is snapshot_T1={Cash:150}, the more recent snapshot.
           No two saves ever in-flight simultaneously. DESIGN: PASS
@@ -344,50 +353,97 @@ Step 3:   DataStore serializes: autosave (Cash:100) runs last → overwrites dis
 
 ### Save/Release Concurrency (now handled by disconnectPlayer)
 
-**Scenario SR-1: Autosave in-flight when PlayerRemoving fires (updated for Revision 5)**
+**Scenario SO-5: Autosave fires while in "disconnecting" state — rejected by savePlayer (NEW — Revision 6)**
+
+```
+Setup:    disconnectPlayer(X) has started; playerState[X]="disconnecting"; sessionTokens[X]=nil.
+          A coroutine (autosave loop) calls savePlayer(X).
+Step 1:   savePlayer: playerState[X] == "disconnecting" ≠ "active" → return false immediately.
+          No DataStore call. No inFlightSaves increment. PASS
+Step 2:   disconnectPlayer proceeds normally (drain already 0 or in progress; this call is a no-op).
+Expected: Autosave in "disconnecting" state is a silent no-op. DESIGN: PASS
+```
+
+---
+
+**Scenario IW-4: In-flight refresh at disconnect — TTL anchor analysis (NEW — Revision 6)**
+
+```
+Setup:    Server A: refreshSession task running (UpdateAsync in progress; token T_A captured).
+          disconnectPlayer fires concurrently.
+Step 1:   disconnectPlayer: activeLocks[X]=nil; sessionTokens[X]=nil.
+          Refresh loop will not start another refresh for X on next tick.
+          But the currently-running refresh task continues with its captured token T_A.
+Step 2:   In-flight refresh completes: current._session.token == T_A == captured token.
+          Writes _session.since = T2 to DataStore.
+
+Normal path:
+Step 3:   disconnectPlayer: drain (inFlightSaves==0; refresh does not use inFlightSaves),
+          snapshot taken, disconnectSave called.
+Step 4:   disconnectSave commits: DataStore = {snapshot, _session:{T_A, since=T3}}.
+          (Note: disconnect save writes new _session from current, updating since=T3.)
+Step 5:   releaseSession → released=true in DataStore.
+          In-flight refresh at T2 has no effect: released=true allows immediate acquisition.
+DESIGN: PASS (normal path unaffected by in-flight refresh)
+
+Abandoned path (if drain timeout):
+Step 3:   disconnectPlayer: DRAIN_DEADLINE exceeded → state→"abandoned"; return.
+Step 4:   DataStore has _session.since = T2 (from in-flight refresh at step 2).
+          TTL countdown: another server can acquire at T2 + LOCK_TTL, NOT at T1 + LOCK_TTL.
+          Worst case: T2 is LOCK_REFRESH (~20s) after T1 → another server waits up to
+          LOCK_REFRESH + LOCK_TTL seconds from T1.
+DESIGN: PASS with Risk 8 documented (TTL anchor is T2, not T1).
+```
+
+---
+
+**Scenario SR-1: Autosave in-flight when PlayerRemoving fires (updated for Revision 6)**
 
 ```
 Setup:    Autosave in flight (inFlightSaves[X]=1; snapshot_T0 captured). PlayerRemoving fires.
 Step 1:   disconnectPlayer(X): shuttingDown[X]=true; sessionTokens[X]=nil; drain wait.
 Step 2:   Autosave completes; inFlightSaves[X]=0 → drain passes.
-Step 3:   Disconnect save: snapshot_T1 captured (most recent); inFlightSaves[X]=1; UpdateAsync.
-Step 4:   Disconnect save completes; inFlightSaves[X]=0.
+Step 3:   snapshot_T1=deepCopy(loadedData[X]) taken (most recent data after drain).
+          disconnectSave(X, player, T_A, snapshot_T1); inFlightSaves[X]=1; UpdateAsync.
+Step 4:   Disconnect save completes: result._session.token==T_A → ✅; inFlightSaves[X]=0; return true.
 Step 5:   releaseSession → released=true ✅.
 Expected: One save at a time. Final state = snapshot_T1 ≥ snapshot_T0. DESIGN: PASS
 ```
 
-**Scenario SR-2: New save attempt after `sessionTokens` cleared**
+**Scenario SR-2: Autosave attempt while in "disconnecting" state**
 
 ```
-Setup:    releaseSession in progress; sessionTokens[X] = nil.
-          A second autosave fires.
-Step 1:   savePlayer: playerState[X] == "releasing" → check passes (releasing allows saves).
-Step 2:   local token = sessionTokens[X] → nil.
-Step 3:   if token == nil: return false immediately. PASS
-Expected: Second save rejected before any DataStore call. DESIGN: PASS
+Setup:    disconnectPlayer in progress; state[X]="disconnecting"; sessionTokens[X]=nil.
+          An autosave coroutine calls savePlayer(X).
+Step 1:   savePlayer: playerState[X] == "disconnecting" ≠ "active" → return false immediately. PASS
+          (token nil check is not reached; state check is first.)
+Expected: Autosave rejected before any DataStore call. DESIGN: PASS
+Note:     sessionTokens nil is defence-in-depth only; the state check alone is sufficient.
 ```
 
-**Scenario SR-3: Both PlayerRemoving and BindToClose call releaseSession**
+**Scenario SR-3: Both PlayerRemoving and BindToClose call disconnectPlayer**
 
 ```
 Setup:    Server shutdown: PlayerRemoving and BindToClose both fire for Player X.
-Step 1:   Thread A (PlayerRemoving): releaseSession → state "active" → "releasing"; token T_A captured.
-Step 2:   Thread B (BindToClose): releaseSession → state == "releasing" → no-op; returns. PASS
-Step 3:   Thread A release UpdateAsync → state → "released". PASS
-Expected: Exactly one release written. No duplicate state transition. DESIGN: PASS
+Step 1:   Thread A (PlayerRemoving): disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle.
+Step 2:   Thread B (BindToClose): disconnectPlayer(X) → shuttingDown[X]==true → return immediately. PASS
+Step 3:   Thread A lifecycle: drain→disconnectSave→releaseSession → state→"released". PASS
+Expected: Exactly one save, one release. No competing saves or releases. DESIGN: PASS
+Note:     See SO-1/SO-2 for detailed timelines of PlayerRemoving-first and BindToClose-first orderings.
 ```
 
 **Scenario SR-4: Release UpdateAsync fails all retries**
 
 ```
-Setup:    PlayerRemoving fires; releaseSession starts; all 3 release UpdateAsync attempts fail.
+Setup:    PlayerRemoving fires; disconnectSave succeeds; releaseSession starts;
+          all 3 release UpdateAsync attempts fail (DataStore errors only).
 Step 1:   released = false after loop.
-Step 2:   warn("Release failed for userId=X. Lock will expire after 60s.").
-Step 3:   playerState[X] = "released" (unconditional).
-Step 4:   activeLocks[X] was cleared in releaseSession — refresh loop no longer refreshes X's session.
-Step 5:   DataStore: X's session TTL counts down from last successful refresh.
-Step 6:   After LOCK_TTL=60s, session expires → available for acquisition on rejoin.
-Expected: Session expires via TTL. No permanent lock. DESIGN: PASS (with 60s delay before rejoin)
+Step 2:   warn("Release failed for userId=X. Lock will expire after ~60s.").
+Step 3:   playerState[X] = "abandoned" (all retries exhausted → TTL path).
+Step 4:   activeLocks[X] was cleared by disconnectPlayer — refresh loop no longer refreshes X.
+Step 5:   DataStore: X's session TTL counts down from last successful _session.since write.
+Step 6:   After LOCK_TTL=60s from that write, session expires → available for acquisition on rejoin.
+Expected: Session expires via TTL. No permanent lock. DESIGN: PASS (with up to 60s delay before rejoin)
 ```
 
 **Scenario SR-5: `savePlayer` called after state is "released"**
@@ -395,7 +451,7 @@ Expected: Session expires via TTL. No permanent lock. DESIGN: PASS (with 60s del
 ```
 Setup:    PlayerRemoving has completed; state = "released"; loadedData[X] = nil.
           BindToClose fires and tries savePlayer(X).
-Step 1:   savePlayer: playerState[X] == "released" → not "active"/"releasing" → return false. PASS
+Step 1:   savePlayer: playerState[X] == "released" → not "active" → return false. PASS
 Expected: No DataStore call. DESIGN: PASS
 ```
 
@@ -481,7 +537,7 @@ DESIGN: PASS
 
 ```
 Session loss detected; invalidated[X]=true; state="invalidated".
-Autosave: savePlayer → state check: "invalidated" ≠ "active"/"releasing" → return false. PASS
+Autosave: savePlayer → state check: "invalidated" ≠ "active" → return false. PASS
 ```
 
 ---
@@ -499,11 +555,11 @@ DESIGN: PASS
 **Scenario S-2: Rapid shutdown (BindToClose fires before PlayerRemoving completes)**
 
 ```
-BindToClose: savePlayer(X) starts; token T_A captured; UpdateAsync yields.
-PlayerRemoving: releaseSession → state "active"→"releasing"; sessionTokens[X]=nil; T_A captured.
-BindToClose save callback: T_A matches DataStore → writes data. PASS
-PlayerRemoving release callback: T_A matches → marks released=true. PASS
-DESIGN: PASS
+Both fire: disconnectPlayer with shuttingDown guard ensures single-owner lifecycle.
+See SO-1 (PlayerRemoving first) and SO-2 (BindToClose first) for the two orderings.
+The old model (BindToClose calls savePlayer, PlayerRemoving calls releaseSession independently)
+is replaced by disconnectPlayer in Revision 5. No competing saves or releases are possible.
+DESIGN: PASS (via disconnectPlayer)
 ```
 
 ---
@@ -534,6 +590,17 @@ The following tests must be executed in Roblox Studio after implementation. None
 | T-18 | TTL-expired same-server session | Studio: same JobId; write old session with `since` > 60s ago | New load acquires session | Kicked as "active on another server" |
 
 ---
+
+## Tests Added for Revision 6 (Architecture Issues D-14, Risk 8)
+
+| Test | Issue covered | Scenario reference |
+|---|---|---|
+| Autosave rejected in "disconnecting" state by savePlayer state guard | D-14 — savePlayer rejects disconnect save | SO-5 |
+| disconnectSave called with explicit token+snapshot after drain | D-14 | SO-4 (updated), SR-1 (updated) |
+| In-flight refresh can extend TTL anchor in abandoned path | Risk 8 — in-flight refresh TTL extension | IW-4 |
+| getData blocked in "disconnecting" state (not "releasing") | D-14 / "releasing" state removed | ML-3 (updated) |
+| SR-4: release failure transitions to "abandoned" (not "released") | D-14 / state machine consistency | SR-4 (updated) |
+| IW-3 (save failure): disconnectSave decrements inFlightSaves before returning | D-14 / no nil-decrement risk | IW-3 (updated) |
 
 ## Tests Added for Revision 5 (Architecture Issues D-10 through D-13)
 
