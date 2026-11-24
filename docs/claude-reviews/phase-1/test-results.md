@@ -1,8 +1,8 @@
-# Phase 1 Test Results — Cash Empire Tycoon (Revision 7)
+# Phase 1 Test Results — Cash Empire Tycoon (Revision 8)
 
 **Date:** 2026-11-24
 **Commit under review:** b05aa20 (`feature/phase-1-data-foundation`)
-**Review revision:** 7
+**Review revision:** 8
 **Status:** Test plan revised — runtime tests not yet executed
 
 > **Note:** All test results in this document are design-level analysis. No runtime tests have been executed. Test scenarios marked PASS/FAIL reflect whether the revised design is expected to handle them correctly, not observed runtime behaviour.
@@ -19,8 +19,9 @@
 | Session lock prevents duplicate writes | Save callback: `current._session.token ~= token` → return nil → no write | Yes |
 | Stale lock (TTL expired) allows new server to acquire | Acquisition callback: `(now - sess.since) >= LOCK_TTL` → available for acquisition | Yes |
 | `addCash`/`spendCash` blocked after session loss | `invalidated[userId]=true` → `getData` returns nil → operations return false/nil | Yes |
-| Duplicate disconnect ownership rejected | `shuttingDown[userId]` guard: second caller (PlayerRemoving or BindToClose) returns immediately without any DataStore call | Yes |
-| BindToClose completes within 25 s deadline | Each player gets a concurrent `task.spawn(disconnectPlayer)` — per-player disconnect is serialized (drain→save→release); BindToClose waits up to 25 s for all to finish | Yes |
+| Duplicate disconnect ownership rejected | `shuttingDown[userId]` guard: first caller owns lifecycle; second caller waits for `shuttingDown` to clear before returning (R25) — `disconnectCount` only decremented after real completion | Yes |
+| BindToClose completes within 25 s deadline | Each player gets a concurrent `task.spawn(disconnectPlayer)` — per-player disconnect is serialized (drain→save→release); BindToClose waits up to 25 s for all to finish; counter accurate because observers wait-on-owner | Yes |
+| Player can rejoin same server after disconnect | `playerState[userId]` is cleared to nil after all async ops complete; `loadPlayer` accepts nil state (R24); stale refresh from old session cannot invalidate new session (R23) | Yes |
 | Legacy records (no `_session`) load correctly | Acquisition callback: `current._session == nil` → treated as available; all existing fields preserved | Yes |
 | `_session` never in `getData` return value | `loadedData[userId]` populated without `_session` at load time; `getData` returns that table | Yes |
 
@@ -456,6 +457,66 @@ Step 2:   If persistent-failure handler also fires (e.g., multiple errors after 
 Expected: Post-release refresh completion is a silent no-op. DESIGN: PASS
 ```
 
+### Rejoin Race Scenarios (NEW — Revision 8, D-16)
+
+**Scenario RJ-1: Old T_A refresh completes with failure after T_B is active — dual check blocks invalidation**
+
+```
+Setup:    T_A disconnects; disconnectPlayer completes; playerState[X]=nil (cleanup).
+          Player rejoins: loadPlayer → T_B active; playerState[X]="active"; sessionTokens[X]=T_B.
+          Old T_A refreshSession UpdateAsync (captured T_A) finally returns nil.
+Step 1:   §7.2 else branch: result==nil.
+          First check: playerState[X]=="active" → passes.
+          Second check: sessionTokens[X]==T_B ≠ T_A (captured) → FAILS → return false. ✅
+Expected: T_B session unaffected. No invalidation. No kick. DESIGN: PASS
+
+Broken (Revision 7) behaviour:
+          Only first check ran: playerState=="active" → passed → playerState="invalidated"; T_B kicked ← D-16
+```
+
+**Scenario RJ-2: Old T_A refresh succeeds after T_B is active — identity check prevents lastRefresh update**
+
+```
+Setup:    T_A disconnects (DataStore still has T_A — T_B not yet written).
+          Player rejoins: loadPlayer for T_B in progress (state="loading").
+          T_A refresh UpdateAsync: current._session.token==T_A → callback matches → writes since=T2.
+          result._session.token==T_A.
+Step 1:   Success path dual check: playerState[X]=="loading" ≠ "active" → first check FAILS → return false. ✅
+          lastRefresh[X] NOT updated.
+Variant:  T_B fully active (state="active"; sessionTokens[X]=T_B) when T_A refresh returns.
+          First check: playerState=="active" → passes.
+          Second check: sessionTokens[X]==T_B ≠ T_A → FAILS → return false. ✅
+          lastRefresh[X] NOT updated to stale T_A's time.
+Expected: Stale successful refresh silently ignored; T_B's lastRefresh unaffected. DESIGN: PASS
+```
+
+**Scenario RJ-3: Persistent refresh failure from T_A after T_B is active — dual check prevents kick**
+
+```
+Setup:    T_A disconnects; T_B active (state="active"; sessionTokens[X]=T_B).
+          T_A refresh has been failing; now os.time()-lastRefresh[X] > LOCK_TTL (§7.3 TTL path).
+Step 1:   §7.3: first check: playerState[X]=="active" → passes.
+          Second check: sessionTokens[X]==T_B ≠ T_A (captured by T_A refresh) → FAILS → return false. ✅
+Expected: T_A's expired lock does not invalidate or kick T_B session. DESIGN: PASS
+```
+
+**Scenario BC-1: BindToClose with PlayerRemoving owning lifecycle — wait-for-owner (NEW — Revision 8, D-16)**
+
+```
+Setup:    Server shutdown: PlayerRemoving fires; BindToClose fires.
+Step 1:   PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle starts; yields at drain.
+Step 2:   BindToClose: task.spawn → disconnectPlayer(X) → shuttingDown[X]==true →
+          observing caller: while shuttingDown[X] do task.wait(0.05) end → loops (does NOT decrement disconnectCount).
+Step 3:   PlayerRemoving lifecycle completes: cleanup sets shuttingDown[X]=nil.
+Step 4:   BindToClose's spawn: while loop exits → disconnectPlayer returns → disconnectCount -= 1 ✅
+
+Broken (Revision 7) behaviour:
+          Step 2: returns immediately → disconnectCount -= 1 fires before lifecycle complete.
+          If all players had PlayerRemoving in progress, disconnectCount reached 0 → BindToClose exited
+          while saves still running. ← D-16 / premature exit
+DESIGN: PASS (Revision 8 — observe-and-wait)
+```
+
 ---
 
 **Scenario SR-1: Autosave in-flight when PlayerRemoving fires (updated for Revision 6)**
@@ -663,6 +724,17 @@ The following tests must be executed in Roblox Studio after implementation. None
 | T-18 | TTL-expired same-server session | Studio: same JobId; write old session with `since` > 60s ago | New load acquires session | Kicked as "active on another server" |
 
 ---
+
+## Tests Added for Revision 8 (Architecture Issues D-16)
+
+| Test | Issue covered | Scenario reference |
+|---|---|---|
+| Old T_A refresh failure after T_B active — dual check blocks invalidation/kick | D-16 — stale refresh invalidates new session | RJ-1 |
+| Old T_A refresh success after T_B active — identity check blocks lastRefresh update | D-16 | RJ-2 |
+| Persistent T_A refresh failure after T_B active — dual TTL-expiry check blocks kick | D-16 | RJ-3 |
+| BindToClose observe-and-wait: second disconnectPlayer caller waits for owner before returning | D-16 — premature disconnectCount decrement | BC-1 |
+| Timeline C/D updated: observing caller waits on shuttingDown before returning | D-16 | Timeline C, D (updated) |
+| Rejoin acceptance criterion added: playerState cleared to nil enables same-server rejoin | D-16 — cleanup contradiction | Acceptance criteria (updated) |
 
 ## Tests Added for Revision 7 (Architecture Issue D-15)
 

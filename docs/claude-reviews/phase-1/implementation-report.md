@@ -1,9 +1,9 @@
-# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 7)
+# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 8)
 
 **Date:** 2026-11-24
 **Branch:** `feature/phase-1-data-foundation` (commit b05aa20)
 **Review branch:** `claude-review/phase-1`
-**Status:** Revision 7 — pending approval before implementation
+**Status:** Revision 8 — pending approval before implementation
 
 ---
 
@@ -353,3 +353,67 @@ See architecture §7.1, §7.2, §7.3 (Revision 7).
 | Stale state description in §4 "abandoned" | "abandoned" only described drain-timeout; did not mention session-stolen path from disconnectSave | Updated to include "session stolen during disconnectSave" |
 | Stale §4 cleanup note | Listed only some state tables; said "On PlayerRemoving" | Updated to list all tables (including `inFlightSaves`, `shuttingDown`) and attributed cleanup to `disconnectPlayer` |
 | Stale §7.5 | Described in-flight refresh risk without addressing whether the refresh would falsely detect ownership loss or overwrite disconnect state | Revised to explain: fixed callback prevents false ownership loss; state guard prevents "invalidated" overwrite; TTL-extension risk remains in abandoned path only |
+
+---
+
+## Defects Found in Revision 7 Architecture (6ff285d)
+
+### D-16: Stale refresh operation invalidates a newer session for the same userId (CRITICAL)
+
+**File:** `PlayerDataManager.lua` (design)
+
+Revision 7 §7.2 and §7.3 guard refresh result handling with a single check:
+
+```
+if playerState[userId] ~= "active": return false
+```
+
+This is insufficient. A player can disconnect (session T_A), and the same server cleans up and accepts a rejoin (session T_B, state → "active"). An old `refreshSession` task from T_A that was in-flight during the disconnect captured `local token = T_A` and is now completing. With T_B active, `playerState[userId] == "active"` — the state guard passes. The handler then proceeds to invalidate the current session:
+
+1. T_A session disconnects fully. `disconnectPlayer` cleanup: `playerState[userId]` left as `"released"` (not cleared to nil).
+2. `loadPlayer` check: `playerState[userId] ~= nil` → **loadPlayer rejects the rejoin** ← separate contradiction (see below).
+
+   _If playerState were cleared to nil_ (the §4/§10.1 contradiction fix):
+3. Player rejoins: `playerState[userId] == nil` → `loadPlayer` allowed. T_B: state → "active", `sessionTokens[userId] = T_B`.
+4. Old T_A refresh completes. `result == nil` or `result._session.token == T_B ≠ T_A`.
+5. §7.2 handler: `playerState[userId] == "active"` → state guard passes.
+6. `playerState[userId] = "invalidated"`, `invalidated[userId] = true`, player kicked.
+7. T_B session is destroyed by a T_A refresh result. **Data loss; player incorrectly kicked.**
+
+**Additional issue — cleanup contradiction:**
+
+§4 cleanup note says `playerState` is cleared after disconnect, but §10.1 cleanup code sets `playerState` to `"released"` or `"abandoned"` without also clearing it to nil. `loadPlayer` §5.1 rejects any non-nil `playerState`. Therefore, after a session disconnects, `loadPlayer` always rejects a rejoin on the same server — the player can never rejoin the same server instance. This contradicts the design intent (TTL path, same-server rejoins, Studio testing).
+
+**Additional issue — BindToClose `disconnectCount` premature decrement:**
+
+§10.3 BindToClose spawns a task per player that calls `disconnectPlayer` and then decrements `disconnectCount`. If `PlayerRemoving` has already set `shuttingDown[userId] = true`, the BindToClose spawn's `disconnectPlayer` call returns immediately (single-owner guard), and `disconnectCount -= 1` fires before the actual lifecycle is complete. BindToClose's wait loop can reach 0 and exit while `PlayerRemoving` is still running saves.
+
+**Fix:**
+
+1. **§7.2 and §7.3 dual identity check:** Before applying any refresh result to per-player state (whether success, failure, or TTL-expiry), verify BOTH: `playerState[userId] == "active"` AND `sessionTokens[userId] == token` (the captured value). If either fails, the refresh belongs to a stale session; return false without modifying any state.
+
+2. **§10.1 cleanup:** All three cleanup paths (normal, drain-timeout, save-failed) must explicitly set `playerState[userId] = nil` before returning. The drain-timeout path is special: `playerState` is left as `"abandoned"` temporarily so that `loadPlayer` knows a rejoin is not yet safe. When the stalled autosave eventually completes and `inFlightSaves` reaches 0 in §6.3, `savePlayer` must check if `playerState == "abandoned"` and clear it to nil at that point.
+
+3. **§10.3 BindToClose observe-and-wait:** When `disconnectPlayer` observes `shuttingDown[userId]` already set by another caller, it must loop-wait (`while shuttingDown[userId] do task.wait(0.05) end`) before returning. This ensures `disconnectCount -= 1` fires only after the owner's cleanup is complete.
+
+See architecture §7.2, §7.3, §10.1, §10.3 (Revision 8).
+
+---
+
+## Revised Requirements (Revision 8 additions)
+
+| ID | Requirement | Source defect | Architecture section |
+|---|---|---|---|
+| R23 | The §7.2 result handler and §7.3 persistent-failure handler must each check BOTH `playerState[userId] == "active"` AND `sessionTokens[userId] == token` (the captured value) before transitioning to `"invalidated"` or kicking. If either check fails, the refresh belongs to a stale session and must return false without modifying `playerState`, `invalidated`, `lastRefresh`, or calling `Kick`. The same dual check applies to the successful refresh path before updating `lastRefresh[userId]`. | D-16 | §7.2, §7.3 |
+| R24 | All `disconnectPlayer` cleanup paths must explicitly clear `playerState[userId] = nil` as the final cleanup step, to enable a legitimate rejoin on the same server. Exception: the drain-timeout path clears `playerState` to nil only after the stalled autosave's `inFlightSaves` decrement reaches 0 in §6.3 (i.e., `savePlayer` clears `playerState[userId]` when `inFlightSaves` hits 0 and `playerState == "abandoned"`). At no other point may `playerState` be left as a non-nil terminal state after all async operations for the old session are complete. | D-16 | §4, §10.1 |
+| R25 | When `disconnectPlayer` detects that `shuttingDown[userId]` is already `true` (another caller owns the lifecycle), it must loop-wait (`while shuttingDown[userId] do task.wait(0.05) end`) before returning. This ensures that `BindToClose`'s `disconnectCount -= 1` fires only after the actual lifecycle completes, not when the observing caller returns early. The wait exits when the owner clears `shuttingDown[userId] = nil` in its cleanup. | D-16 | §10.3 |
+
+---
+
+## Summary of Changes from Revision 7 (6ff285d)
+
+| Issue | Revision 7 problem | Revision 8 fix |
+|---|---|---|
+| D-16 — stale refresh invalidates new session | §7.2/§7.3 guarded only on `playerState == "active"`; a rejoin T_B could be active while old T_A refresh completes → T_B session invalidated/kicked | Dual identity check: `playerState == "active"` AND `sessionTokens[userId] == capturedToken` both required; stale T_A refresh returns false on second check |
+| §4/§10.1 cleanup contradiction | §4 said playerState is cleared; §10.1 set it to "released"/"abandoned" but never nil'd it; §5.1 rejects non-nil playerState → rejoin always blocked | §10.1 cleanup explicitly clears `playerState[userId] = nil`; drain-timeout path defers clear to §6.3 after autosave completes |
+| BindToClose disconnectCount premature decrement | Second caller's `disconnectPlayer` returned immediately (shuttingDown guard); `disconnectCount -= 1` fired before lifecycle complete; BindToClose could exit early | Observing caller waits on `shuttingDown` before returning; counter only decremented after real completion |

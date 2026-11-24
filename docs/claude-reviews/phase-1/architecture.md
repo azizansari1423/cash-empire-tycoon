@@ -1,8 +1,8 @@
-# Phase 1 Architecture — Cash Empire Tycoon (Revision 7)
+# Phase 1 Architecture — Cash Empire Tycoon (Revision 8)
 
 **Date:** 2026-11-24
 **Scope:** `PlayerDataManager.lua` session locking design
-**Status:** Revision 7 — pending approval before implementation
+**Status:** Revision 8 — pending approval before implementation
 
 ---
 
@@ -109,9 +109,12 @@ session loss   disconnectPlayer called
 - `"active" → "disconnecting"`: start of `disconnectPlayer`; first caller wins (see §10)
 - `"disconnecting" → "released"`: saves drained, disconnect save committed, release UpdateAsync confirmed
 - `"disconnecting" → "abandoned"`: drain deadline exceeded; disconnectSave detects session loss; disconnectSave all retries exhausted; or releaseSession all retries exhausted
-- `"active" → "invalidated"`: confirmed session loss in `savePlayer` or `refreshSession`, **only when `playerState` is still `"active"` at the time of result verification** — see §7.2 for the state guard
+- `"active" → "invalidated"`: confirmed session loss in `savePlayer` or `refreshSession`, **only when `playerState` is still `"active"` AND `sessionTokens[userId]` still equals the captured token at the time of result verification** — see §7.2 for the dual identity check
+- `"released" → nil` / `"abandoned" → nil`: cleared explicitly by `disconnectPlayer` cleanup after all async operations finish, enabling a legitimate rejoin on the same server
 
-**Cleanup:** After `disconnectPlayer` completes (whether via normal release or any terminal path), all per-player state tables (`playerState`, `loadedData`, `sessionTokens`, `activeLocks`, `lastRefresh`, `inFlightSaves`, `shuttingDown`) are cleared.
+**Cleanup:** After `disconnectPlayer` completes (whether via normal release or any terminal path), all per-player state tables — including `playerState` itself — are cleared to nil: `playerState`, `loadedData`, `sessionTokens`, `activeLocks`, `lastRefresh`, `inFlightSaves`, `shuttingDown`.
+
+**Rejoin safety:** `playerState[userId] = nil` after cleanup is what allows `loadPlayer` to accept a rejoin on the same server (§5.1 rejects any non-nil state). The dual identity check in §7.2–7.3 (not playerState alone) is what blocks stale refresh operations from the old session from interfering with the new one.
 
 ---
 
@@ -339,6 +342,8 @@ return saveSucceeded
 
 `confirmedSessionLoss` and `saveSucceeded` are set in the outer loop body, not inside the callback. The in-flight counter is decremented unconditionally so `releaseSession` is never blocked by a save that errored out silently.
 
+**Drain-timeout cleanup:** In the drain-timeout TTL path (§10.1 step 3), `disconnectPlayer` exits without clearing `inFlightSaves` because the autosave still owns its slot. After the decrement at the end of `savePlayer`, if `playerState[userId] == "abandoned"` and `inFlightSaves[userId]` reaches 0, `savePlayer` must clear `playerState[userId] = nil`. This releases the userId for a rejoin — it is safe to do so because there are no remaining async operations from the old session.
+
 **Token-mismatch non-nil result:** If `UpdateAsync` returns the existing DataStore value (not nil) when our callback returned nil, `result._session.token` will be another server's token. The `ok and` branch (above) catches this: `result ~= nil but token ~= our token` → `confirmedSessionLoss = true`. This is the second path that correctly detects session loss without relying on `result == nil` alone.
 
 ### 6.4 Execution timeline — save snapshot + callback retry with ownership change
@@ -487,7 +492,13 @@ callback(current):
 
 The token is captured once before the `UpdateAsync` call. The callback and all result verification use this captured local — `sessionTokens[userId]` is never read again after capture. This is the same pattern as §6.1–6.3 (savePlayer) and prevents incorrect ownership-loss detection if `disconnectPlayer` clears `sessionTokens[userId]` while the callback is in-flight or being retried.
 
-Success is confirmed only when `result._session.token == token` (the captured value). Every other non-error outcome must check whether the state has transitioned away from `"active"` before treating it as ownership loss — see the state guard below.
+**Dual identity check:** Before applying any refresh result to per-player state, two conditions must both hold:
+1. `playerState[userId] == "active"` — the player has not entered a disconnect or post-disconnect state
+2. `sessionTokens[userId] == token` (the captured value) — the captured token still identifies the currently active session; a different token means a new session T_B is active
+
+If either check fails, this refresh operation belongs to a stale or disconnecting session. It must not modify `playerState`, `invalidated`, `lastRefresh`, or kick the player.
+
+**Why the second check is necessary:** After `disconnectPlayer` completes its cleanup and clears `playerState[userId]` to nil, the player can rejoin on the same server and `loadPlayer` can run again (§5.1 accepts nil state). The new session T_B sets `playerState[userId] = "active"` and `sessionTokens[userId] = T_B`. If the old T_A refresh completes now, `playerState == "active"` passes — but `sessionTokens[userId] == T_B ≠ T_A` (the captured token). The second check catches this case. Without it, the stale T_A refresh would invalidate and kick the new T_B session.
 
 ```
 local token = sessionTokens[userId]  -- capture before UpdateAsync; stable reference
@@ -496,23 +507,33 @@ ok, result = pcall(PlayerStore.UpdateAsync, userId, callback)
 
 if ok:
     if result ~= nil and result._session ~= nil and result._session.token == token:
-        lastRefresh[userId] = os.time()       -- confirmed refresh
+        -- Confirmed refresh. Apply only if this result belongs to the current active session.
+        if playerState[userId] ~= "active" or sessionTokens[userId] ~= token:
+            -- State has transitioned (disconnect in progress or complete) or a new session
+            -- has taken over. Ignore this stale success silently.
+            return false
+        lastRefresh[userId] = os.time()
         return true
     else:
         -- result == nil (callback returned nil) OR
         -- result._session.token ~= token (non-nil result, wrong token)
-        -- The callback returned nil. This may be genuine ownership loss, OR it may
-        -- be an expected nil from a retry after disconnectPlayer cleared sessionTokens.
-        -- Either way, with the fixed callback (using captured token), nil means the
-        -- callback correctly detected a token mismatch in DataStore.
+        -- The callback correctly detected a token mismatch in DataStore.
         
+        -- Dual identity check: both conditions must hold for this to be a genuine
+        -- ownership-loss event that should invalidate the current session.
         if playerState[userId] ~= "active":
             -- Disconnect or post-disconnect state: "disconnecting", "released", "abandoned".
             -- Do NOT set "invalidated": the disconnect lifecycle handles cleanup.
             -- Do NOT kick: the player is already leaving or has already left.
             return false
         
-        -- Genuine ownership loss in "active" state.
+        if sessionTokens[userId] ~= token:
+            -- A new session (T_B) is now active on this server for the same userId.
+            -- This refresh result belongs to the old session (T_A). Ignoring it silently
+            -- prevents the stale T_A result from invalidating or kicking the T_B player.
+            return false
+        
+        -- Both checks passed: genuine ownership loss in "active" state for this session.
         playerState[userId] = "invalidated"
         invalidated[userId] = true
         warn("Session ownership lost during refresh for userId=" .. userId)
@@ -525,22 +546,34 @@ if not ok:
     return false                               -- non-fatal single failure; see §7.3
 ```
 
+**Distinction between callback and result-handler ownership verification:**
+
+The callback's ownership check (captured token vs `current._session.token`) verifies **DataStore ownership**: "does the DataStore record still belong to this session's token?" It runs inside UpdateAsync, with no access to current in-memory state.
+
+The result handler's dual identity check (state guard + token identity) verifies **session currency**: "is this session's result still relevant to the player currently loaded on this server?" It runs after UpdateAsync returns, with access to current in-memory state. These are two independent correctness checks that serve different failure modes.
+
 ### 7.3 Persistent refresh failure handling
 
-The refresh loop tracks `lastRefresh[userId]`. On each DataStore error:
+The refresh loop tracks `lastRefresh[userId]`. On each DataStore error, the same dual identity check applies: both `playerState[userId] == "active"` AND `sessionTokens[userId] == token` (the captured value) must hold before treating TTL expiry as a reason to invalidate the current session.
 
 ```
 if os.time() - (lastRefresh[userId] or 0) > LOCK_TTL:
     -- Lock has certainly expired; treat as stolen.
+    
+    -- Dual identity check (same as §7.2):
     if playerState[userId] ~= "active":
         return false   -- disconnect in progress or already complete; do not interfere
-    -- Genuine TTL expiry in "active" state.
+    
+    if sessionTokens[userId] ~= token:
+        return false   -- a new session T_B is now active; stale T_A failure must not kick T_B
+    
+    -- Both checks passed: genuine TTL expiry for the currently active session.
     playerState[userId] = "invalidated"
     invalidated[userId] = true
     kick(...)
 ```
 
-A single transient failure does not trigger a kick if `os.time() - lastRefresh < LOCK_TTL` (the lock has not yet expired). The state guard applies equally to the TTL-expiry path.
+A single transient failure does not trigger a kick if `os.time() - lastRefresh < LOCK_TTL` (the lock has not yet expired). The dual identity check applies equally to the TTL-expiry path.
 
 ### 7.4 Refresh loop
 
@@ -565,9 +598,12 @@ When `disconnectPlayer` clears `activeLocks[userId]` (§10.1 step 2), the refres
 
 No — with the fixed callback (§7.1). The callback uses the captured `token` (not live `sessionTokens[userId]`). Even after `disconnectPlayer` clears `sessionTokens[userId] = nil`, the callback still compares `current._session.token ~= T_A` (the captured value). If the session has not been stolen, the comparison succeeds and the refresh completes normally. Only a genuine token mismatch in DataStore (another server holds the session) causes the callback to return nil.
 
-**Will the in-flight refresh overwrite `"disconnecting"` state?**
+**Will the in-flight refresh overwrite `"disconnecting"` state, or a later "active" session?**
 
-No. The §7.2 result handler checks `playerState[userId] ~= "active"` before transitioning to `"invalidated"`. If the player is in `"disconnecting"` state at the time the refresh result is checked, the handler returns false without modifying `playerState`. `disconnectSave` can proceed normally.
+No — the dual identity check in §7.2 covers both cases:
+
+- *During disconnect*: `playerState == "disconnecting"` → first check fails → return false. `disconnectSave` unblocked.
+- *After disconnect cleanup and player rejoin*: cleanup clears `playerState` to nil and `sessionTokens` to nil. New `loadPlayer` runs for T_B: state → "active", `sessionTokens[userId] = T_B`. Old T_A refresh completes: `playerState == "active"` passes first check, but `sessionTokens[userId] == T_B ≠ T_A` (captured by T_A) → second check fails → return false. T_B session is unaffected.
 
 **Can an in-flight refresh extend the TTL?**
 
@@ -740,6 +776,13 @@ function disconnectPlayer(userId, player):
         invalidated[userId]   = nil
         lastRefresh[userId]   = nil
         shuttingDown[userId]  = nil
+        -- playerState[userId] is left as "abandoned" temporarily so the autosave's
+        -- inFlightSaves decrement does not race with a concurrent loadPlayer.
+        -- It will not block a rejoin: loadPlayer checks playerState ~= nil and will
+        -- see "abandoned" → cannot rejoin until autosave completes and clears it.
+        -- The autosave's UpdateAsync completion callback must clear playerState to nil.
+        -- (See §6.3: after the final decrement of inFlightSaves, if playerState is
+        -- "abandoned" and inFlightSaves reaches 0, clear playerState[userId] = nil.)
         return
     
     -- 4. Take final snapshot (all autosaves committed; this is the most recent data)
@@ -765,6 +808,7 @@ function disconnectPlayer(userId, player):
         lastRefresh[userId]   = nil
         inFlightSaves[userId] = nil   -- disconnectSave already decremented to 0
         shuttingDown[userId]  = nil
+        playerState[userId]   = nil   -- clear terminal state; enables rejoin on same server
         return
     
     -- 6. Release session (inFlightSaves[userId] == 0 confirmed by disconnectSave returning true)
@@ -776,7 +820,10 @@ function disconnectPlayer(userId, player):
     lastRefresh[userId]   = nil
     inFlightSaves[userId] = nil
     shuttingDown[userId]  = nil
-    -- playerState already set to "released" or "abandoned" by releaseSession
+    playerState[userId]   = nil   -- clear "released" or "abandoned"; enables rejoin on same server
+    -- Clearing playerState to nil is safe here: all async operations (drain, disconnectSave,
+    -- releaseSession) have completed. No in-flight callbacks remain. A new loadPlayer
+    -- can now start for this userId if the player rejoins.
 ```
 
 **Why state tables are only cleared after all async operations complete:**
@@ -796,6 +843,26 @@ end)
 
 ### 10.3 `BindToClose`
 
+**Ownership-observation problem with `disconnectCount`:**
+
+If `PlayerRemoving` has already called `disconnectPlayer(userId)` and set `shuttingDown[userId] = true`, a second call from BindToClose's spawn returns immediately (single-owner guard). That immediate return causes `disconnectCount -= 1` to fire before the actual lifecycle completes. If all players are in this state, `disconnectCount` reaches 0 and BindToClose exits while PlayerRemoving is still running saves.
+
+**Fix:** `disconnectPlayer` must wait for the owner to finish before returning, when it observes that another caller already owns the lifecycle. It loops on `shuttingDown[userId]` until the owner clears it (step 7 cleanup). This ensures `disconnectCount -= 1` only fires after real completion.
+
+```
+function disconnectPlayer(userId, player):
+    -- 1. Single-owner guard (revised)
+    if shuttingDown[userId]:
+        -- Another caller owns this lifecycle. Wait for it to complete.
+        while shuttingDown[userId] do
+            task.wait(0.05)
+        end
+        return   -- shuttingDown cleared means owner finished cleanup; counter safe to decrement
+    if playerState[userId] ~= "active": return
+    shuttingDown[userId] = true
+    -- ... rest of lifecycle unchanged ...
+```
+
 ```
 game:BindToClose(function()
     local disconnectCount = 0
@@ -804,6 +871,8 @@ game:BindToClose(function()
         local userId = tostring(player.UserId)
         task.spawn(function()
             disconnectPlayer(userId, player)
+            -- By the time disconnectPlayer returns, the full lifecycle is complete
+            -- (either this call owned it, or it waited for the owner to finish).
             disconnectCount -= 1
         end)
     end
@@ -816,6 +885,8 @@ game:BindToClose(function()
     end
 end)
 ```
+
+**Why this is correct:** `disconnectPlayer` clears `shuttingDown[userId] = nil` in every cleanup path (step 3 timeout, step 5 failure, step 7 normal). An observing caller's `while shuttingDown[userId]` loop exits only after the owner's cleanup is complete. The 25-second deadline still applies — if the owner's lifecycle exceeds DRAIN_DEADLINE (5 s) + save retries + release retries, the BindToClose deadline may be reached with `disconnectCount > 0`, and the warning fires. This is an acceptable degraded-path outcome.
 
 ### 10.4 Execution timelines
 
@@ -853,21 +924,27 @@ T7  Cleanup.
 
 No two saves are in flight simultaneously. The disconnect save always starts after any prior autosave completes. snapshot_T1 captures all data written between T0 (autosave capture) and T4 (disconnect capture). The final DataStore state is snapshot_T1, which is the most recent snapshot. ✅
 
-**Timeline C: PlayerRemoving fires before BindToClose reaches same player**
+**Timeline C: PlayerRemoving fires first; BindToClose observes and waits (Revision 8 fix)**
 
 ```
-T0  PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle runs.
-T1  BindToClose iterates Players. If player X is in the list:
-    disconnectPlayer(X) → shuttingDown[X]==true → returns immediately ✅
-PlayerRemoving's lifecycle handles everything; BindToClose is a no-op for this player.
+T0  PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle starts.
+T1  BindToClose iterates Players. Player X is in the list.
+    task.spawn → disconnectPlayer(X) → shuttingDown[X]==true →
+    observing caller: while shuttingDown[X] do task.wait(0.05) end → loops.
+T2  PlayerRemoving lifecycle completes: cleanup sets shuttingDown[X]=nil.
+T3  BindToClose's spawn: while loop exits → disconnectPlayer returns → disconnectCount -= 1 ✅
+Expected: disconnectCount decremented only after real completion; BindToClose waits correctly. PASS
 ```
 
-**Timeline D: BindToClose fires before PlayerRemoving has started disconnectPlayer**
+**Timeline D: BindToClose fires first; PlayerRemoving observes and waits (Revision 8 fix)**
 
 ```
 T0  BindToClose: task.spawn → disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle starts.
-T1  PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]==true → returns immediately ✅
-BindToClose's lifecycle handles everything for this player.
+T1  PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]==true →
+    observing caller: while shuttingDown[X] do task.wait(0.05) end → loops.
+T2  BindToClose lifecycle completes: cleanup sets shuttingDown[X]=nil.
+T3  PlayerRemoving's disconnectPlayer returns (no work done by observer). ✅
+Expected: No duplicate saves or releases. PASS
 ```
 
 **Timeline E: Autosave drain timeout — TTL path**
@@ -888,6 +965,32 @@ T5  LOCK_TTL expires (60s from last successful _session.since write in DataStore
     be later than T1 if an in-flight refresh completed after disconnect began — see §7.5).
     Session available to other servers. ✅
 Data integrity: autosave snapshot written (T4); no release race. ✅
+```
+
+**Timeline F: Old session T_A disconnects; player rejoins same server with T_B; stale T_A refresh completes (NEW — Revision 8, D-16)**
+
+```
+T0  refreshSession for X (token T_A captured): UpdateAsync in progress.
+T1  PlayerRemoving: disconnectPlayer(X).
+    state→"disconnecting"; sessionTokens[X]=nil; activeLocks[X]=nil.
+T2  disconnectPlayer normal path: drain→disconnectSave→releaseSession.
+    state→"released"; cleanup:
+    loadedData[X]=nil; lastRefresh[X]=nil; shuttingDown[X]=nil;
+    playerState[X]=nil.   ← enables rejoin
+T3  Player rejoins same server. loadPlayer(X): playerState[X]==nil → allowed.
+    New token T_B generated; state→"loading"→"active"; sessionTokens[X]=T_B.
+T4  Stale T_A refresh UpdateAsync completes.
+    result._session.token: depends on DataStore state.
+    Case A: DataStore has T_B (T_B acquired) → result.token==T_B ≠ T_A → else branch.
+            Dual check: playerState=="active" ✓ FIRST CHECK PASSES.
+                        sessionTokens[X]==T_B ≠ T_A ← SECOND CHECK FAILS → return false. ✅
+            T_B session unaffected.
+    Case B: DataStore still has T_A (T_B load in progress, not yet written).
+            Callback: current._session.token==T_A → match → writes since=T4 (refresh succeeds).
+            result.token==T_A: success path dual check:
+                playerState=="active" ✓; sessionTokens[X]==T_B ≠ T_A ← FAILS → return false. ✅
+            lastRefresh[X] is NOT updated to stale T_A's refresh time. T_B session unaffected.
+Expected: Old T_A refresh cannot invalidate, kick, or update state for T_B session. DESIGN: PASS
 ```
 
 ---
