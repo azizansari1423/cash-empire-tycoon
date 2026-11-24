@@ -1,178 +1,136 @@
-# Phase 1 Implementation Report — Cash Empire Tycoon (Revised)
+# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 3)
 
-**Date:** 2026-11-24 (revised from initial review)
-**Branch:** `feature/phase-1-data-foundation`
-**Commit under review:** `b05aa20e3bdb82a4b842e4d1131cd11a16b37170`
-**Reviewer:** Claude Sonnet 4.6
-**Status:** Implementation defects identified; redesign approved pending architecture sign-off
-
----
-
-## Scope
-
-Phase 1 targeted the data persistence layer. No gameplay systems, UI, or monetization were modified.
-
-**Files changed in b05aa20 (3):**
-
-| File | Type of change |
-|---|---|
-| `RobloxTycoon/src/ServerScripts/PlayerDataManager.lua` | Full rewrite |
-| `RobloxTycoon/src/ServerScripts/TycoonManager.server.lua` | 5 targeted edits |
-| `RobloxTycoon/src/ServerScripts/MapBuilder.server.lua` | 8-line addition |
-
-**Files not changed:** `ShopHandler.lua`, `UpgradeTable.lua`, `HUD.client.lua`, all Rojo configs, all LocalScripts.
+**Date:** 2026-11-24
+**Branch:** `feature/phase-1-data-foundation` (commit b05aa20)
+**Review branch:** `claude-review/phase-1`
+**Status:** Architecture revised — pending approval before implementation
 
 ---
 
-## Phase 1 Deliverables — Status
+## Deliverable Status
 
-| Deliverable | Status in b05aa20 | Notes |
+| Deliverable | Status | Notes |
 |---|---|---|
-| Safe player profile loading | ⚠️ Partial | Load case logic correct; GetAsync has no retry (Defect 4) |
-| Protection against saving profiles after failed loads | ✅ Implemented | `loadFailed[userId]` guard on all write paths |
-| Session locking | ⚠️ Defective | Two-DataStore design; save doesn't verify ownership at write time (Defect 1) |
-| Safe autosaving | ⚠️ Partial | `loadFailed` guard present; session-loss detection absent |
-| Safe shutdown handling | ✅ Implemented | Parallel `BindToClose` with 25s deadline |
-| Retry and failure handling | ⚠️ Partial | Save retries present; load retries absent (Defect 4) |
-| Safe handling of player disconnects | ⚠️ Partial | Save and lock release correct; session-loss kick absent |
-| MapBuilder/TycoonManager initialization dependency | ✅ Complete | `ServerStorage.MapReady` signal + `WaitForChild` |
-| Removal of unused Heartbeat connection | ✅ Complete | Dead stub at old lines 100–102 removed |
+| Session locking prevents concurrent writes | Partial | Single-key design specified; not yet implemented |
+| Three-case load distinction | Implemented (b05aa20) | New / existing / failed correctly distinguished |
+| `UpdateAsync` for all writes | Partial | Implemented in b05aa20 but save callback does not verify token |
+| Retry with backoff | Implemented (b05aa20) | In savePlayer; LOAD_RETRIES not yet present |
+| `loadFailed` guard on saves and reads | Partial | `loadFailed` blocks saves; does not block `getData`/`addCash`/`spendCash` |
+| Safe shutdown (`BindToClose`) | Implemented (b05aa20) | 25 s deadline, parallel saves |
+| `MapReady` signal | Implemented (b05aa20) | MapBuilder writes BoolValue; TycoonManager waits on it |
 
 ---
 
 ## Defects Found in b05aa20
 
-### Defect 1 — Stale server can overwrite live session data (Critical)
+### D-1: Two-DataStore architecture (CRITICAL)
 
-**Root cause:** Two-DataStore architecture. Lock in `TycoonSessionLocks_v1`; data in `TycoonPlayerData_v1`. `savePlayer`'s `UpdateAsync` callback ignores `_current` and writes unconditionally. No ownership check at write time.
+**File:** `PlayerDataManager.lua`
 
-**Impact:** A server whose lock has expired (e.g., after a failed refresh) can overwrite data belonging to a newer session on another server.
+`TycoonSessionLocks_v1` and `TycoonPlayerData_v1` are separate DataStore keys. There is no cross-key atomic operation in Roblox DataStores. `savePlayer` cannot verify that the server still holds the lock at the time the data is written — the lock may have expired or been claimed by another server between the lock check and the data write.
 
-**Location:** `PlayerDataManager.lua`, `savePlayer()`.
-
-**Fix:** Single-key design: embed `_session` inside `TycoonPlayerData_v1`. `savePlayer` callback verifies `current._session.token == sessionTokens[userId]` before writing. Mismatch → abort.
+**Fix:** Embed `_session` metadata inside `TycoonPlayerData_v1`. Remove `TycoonSessionLocks_v1` entirely. All lock logic (acquire, verify, refresh, release) becomes a single `UpdateAsync` on the player's one key. See architecture §1.
 
 ---
 
-### Defect 2 — `refreshLock` failure is undetected (High)
+### D-2: Unconditional save write (CRITICAL)
 
-**Root cause:** `pcall` absorbs both DataStore errors and callback-returned-nil (session stolen). Caller cannot distinguish success from failure.
+**File:** `PlayerDataManager.lua`, `savePlayer`
 
-**Impact:** Server may continue operating under a session it no longer owns, then save stale data.
+```lua
+PlayerStore:UpdateAsync(userId, function(_current)
+    return data   -- ignores current; writes unconditionally
+end)
+```
 
-**Location:** `PlayerDataManager.lua`, `refreshLock()` and refresh loop.
+The callback ignores `_current` entirely. It writes `data` regardless of whether this server still holds the session. A server that lost its session will silently overwrite another server's data.
 
-**Fix:** `refreshSession` returns a status indicating success, DataStore error, or confirmed session loss. On confirmed loss: set `loadFailed[userId] = true`, kick player.
-
----
-
-### Defect 3 — `acquireLock` relies on closure mutation with Roblox callback retries (High)
-
-**Root cause:** `acquired = true` is set as a side effect inside the `UpdateAsync` callback. Roblox may invoke the callback multiple times; the final value of `acquired` depends on which invocation ran last.
-
-**Location:** `PlayerDataManager.lua`, `acquireLock()`.
-
-**Fix:** Generate a UUID token before the callback. After `UpdateAsync` returns, verify acquisition by checking `result._session.token == token`. No closure mutation required.
+**Fix:** Save callback must verify `current._session.token == token` (the token captured before entering UpdateAsync). If the token does not match, return nil — no write. See architecture §6.2.
 
 ---
 
-### Defect 4 — `GetAsync` has no retry on transient failure (Medium)
+### D-3: Closure mutation in UpdateAsync callback (CRITICAL)
 
-**Root cause:** A single DataStore error immediately kicks the player and sets `loadFailed`.
+**File:** `PlayerDataManager.lua`, `acquireLock`
 
-**Impact:** Players are unnecessarily kicked during momentary DataStore instability.
+```lua
+local acquired = false
+LockStore:UpdateAsync(userId, function(current)
+    ...
+    acquired = true   -- set inside callback
+    return { ... }
+end)
+return acquired
+```
 
-**Location:** `PlayerDataManager.lua`, `loadPlayer()`.
+Roblox may invoke the UpdateAsync callback multiple times on retry. If call 1 sets `acquired = true` then call 2 returns nil (session taken by another server), the outer function still sees `acquired == true` and reports success. The session may not have been acquired.
 
-**Fix:** Wrap the `UpdateAsync` load call in `withRetry` (3 attempts, 2 s / 4 s backoff). Only kick after all retries are exhausted.
-
----
-
-## Revised Implementation Requirements
-
-The following requirements must be satisfied in the revised `PlayerDataManager.lua`. They supersede b05aa20.
-
-### R1 — Fencing token generation
-
-- Generate using `HttpService:GenerateGUID(false)`.
-- Generate **outside** the `UpdateAsync` callback, before the callback is constructed.
-- Never generate or mutate external state inside the callback.
-- Store in `sessionTokens[userId]` only after confirmed acquisition.
-- One new token per `loadPlayer` invocation; `sessionTokens[userId]` is cleared on disconnect and confirmed session loss.
-
-### R2 — Session acquisition
-
-- Use `PlayerStore:UpdateAsync` on `TycoonPlayerData_v1` for both lock acquisition and data read.
-- Callback must handle four cases without side effects:
-  1. `current == nil` → new player (no prior record)
-  2. `current` with live `_session` owned by another server → return nil (abort)
-  3. `current` with no `_session`, expired `_session`, or our own `_session` → acquire
-  4. Legacy record (existing game data, no `_session`) → acquire; preserve all existing fields
-- Verify acquisition from the returned record: `result._session.token == token`.
-- Retry up to 3 times on DataStore error; kick immediately on confirmed ownership by another server (not a transient error).
-
-### R3 — Save ownership verification
-
-- Guard: `loadFailed[userId]`, `loadedData[userId] == nil`, `sessionTokens[userId] == nil` → reject.
-- Inside `UpdateAsync` callback: check `current._session.token == sessionTokens[userId]`.
-- Match → write `deepCopy(loadedData[userId])` with `_session` restored from `current._session`.
-- Mismatch → return nil; set `loadFailed[userId] = true`; kick player; do NOT retry.
-- DataStore error → retry (up to 3 times).
-
-### R4 — Refresh and release
-
-- `refreshSession`: callback verifies token; on mismatch or nil result → confirmed session loss → `loadFailed = true`, kick.
-- Track `lastSuccessfulRefresh[userId]`; if elapsed > LOCK_TTL without a successful refresh → treat as stolen.
-- `releaseSession`: clear `sessionTokens[userId]` BEFORE the UpdateAsync call; callback verifies the captured token against the stored token; only marks `released = true` if they match.
-
-### R5 — Disconnect and shutdown
-
-- `PlayerRemoving`: save → release → clear `loadedData[userId]`, `sessionTokens[userId]`, `loadFailed[userId]`, `lastRefresh[userId]`.
-- `BindToClose`: parallel saves with 25s deadline; each task calls save then release.
-- `releaseSession` clears `sessionTokens` as its first step; a concurrent second release finds nil and returns without a DataStore call.
-
-### R6 — `_session` isolation
-
-- `loadedData[userId]` must NEVER contain `_session`.
-- Strip `_session` from `result` before constructing `loadedData[userId]`.
-- In `savePlayer` callback: restore `_session` from `current._session` (the DataStore record), not from memory.
-- `_session` is never passed to `addCash`, `spendCash`, `getData`, or any game logic.
-
-### R7 — DataStore name and schema
-
-- DataStore name: `TycoonPlayerData_v1` (unchanged).
-- Player key: `tostring(player.UserId)` (unchanged).
-- Remove `TycoonSessionLocks_v1` entirely.
-- All existing game data fields preserved; `_session` is a hidden sentinel that existing game code never encounters.
+**Fix:** Never set correctness-critical variables inside the UpdateAsync callback. Verify acquisition only from the return value: `ok == true AND result ~= nil AND result._session.token == token`. See architecture §5.4.
 
 ---
 
-## TycoonManager Changes — Status: Complete
+### D-4: `loadFailed` does not block `getData` (HIGH)
 
-The five TycoonManager edits in b05aa20 are correct and do not require revision:
+**File:** `PlayerDataManager.lua`, `getData`
 
-| Edit | Status |
-|---|---|
-| `WaitForChild("MapReady", 30)` initialization dependency | ✅ Correct |
-| `plotsFolder` module-level reference | ✅ Correct |
-| `getPlot` uses `plotsFolder` directly | ✅ Correct |
-| `assignPlot` uses `plotsFolder` directly | ✅ Correct |
-| `PlayerAdded` nil guard after `loadPlayer` | ✅ Correct |
-| `PlayerRemoving` uses `plotsFolder` directly | ✅ Correct |
+```lua
+function PlayerDataManager.getData(player)
+    return loadedData[tostring(player.UserId)]  -- no loadFailed check
+end
+```
 
-## MapBuilder Changes — Status: Complete
+`loadFailed[userId]` blocks `savePlayer` but `getData` returns `loadedData[userId]` unconditionally. After a mid-game session loss, `addCash` and `spendCash` both call `getData` and can still modify the in-memory profile. Those mutations will be lost (the save is blocked) but the player sees incorrect currency balances and can spend currency they no longer have permission to spend.
 
-The `ServerStorage.MapReady` signal in b05aa20 is correct and does not require revision.
+**Fix:** Introduce `invalidated[userId]` (replacing `loadFailed`) that covers both initial load failure and mid-game session loss. `getData` checks `invalidated[userId]` before returning data. See architecture §9.
 
 ---
 
-## What Was Not Changed (Unchanged from b05aa20)
+### D-5: Stolen session not detected on refresh (HIGH)
 
-- `TycoonPlayerData_v1` DataStore name
-- Existing player data key format and schema
-- `ShopHandler.lua`
-- `UpgradeTable.lua`
-- `HUD.client.lua`
-- Rojo configuration files
-- Gamepass IDs, Developer Product IDs, Group ID
-- All gameplay systems
+**File:** `PlayerDataManager.lua`, refresh logic
+
+The refresh function calls `UpdateAsync` to extend the lock TTL but does not verify the token in the returned record. If another server has acquired the session (overwriting the token), the refresh will silently succeed (writing our job ID back over their session) or silently fail — but the outer code takes no action either way. No invalidation, no kick.
+
+**Fix:** Refresh callback verifies `current._session.token == sessionTokens[userId]`. If the token does not match, return nil and treat as confirmed session loss. See architecture §7.2.
+
+---
+
+## Architectural Issue: No Per-Player Lifecycle State (HIGH)
+
+There is no formal state machine governing player data lifecycle. This creates several gaps:
+
+- Two concurrent `loadPlayer` calls for the same player (e.g., rapid rejoin) can race, with the second potentially overwriting the first's session.
+- After `releaseSession` clears `sessionTokens[userId]`, a concurrent in-flight save that already captured the token still holds a reference to it. Without a state guard, `releaseSession` can be called twice by both `PlayerRemoving` and `BindToClose`, writing two release records.
+- No mechanism prevents `savePlayer` from starting after the session has been released.
+
+**Fix:** Introduce `playerState[userId]` state machine with states: `nil/"loading"/"active"/"releasing"/"released"/"failed"/"invalidated"`. All operations check state before proceeding. See architecture §4.
+
+---
+
+## Revised Requirements
+
+| ID | Requirement | Source defect | Architecture section |
+|---|---|---|---|
+| R1 | All lock and data operations use a single DataStore key (`TycoonPlayerData_v1`). `TycoonSessionLocks_v1` is not referenced. | D-1 | §1, §2 |
+| R2 | The fencing token is generated outside the UpdateAsync callback using `HttpService:GenerateGUID(false)`. The token is a read-only closure capture; it is never mutated inside any callback. | D-3 | §3, §5.2 |
+| R3 | Acquisition is confirmed only when `ok==true AND result._session.token==token`. A nil result or token mismatch is treated as confirmed session loss and triggers a kick without retry. | D-3 | §5.4 |
+| R4 | The save callback returns nil if `current._session.token ~= token`. Confirmed session loss in savePlayer transitions state to "invalidated" and kicks the player without retry. DataStore errors are retried up to SAVE_RETRIES times. | D-2 | §6 |
+| R5 | `invalidated[userId]` is set on initial load failure, confirmed save session loss, confirmed refresh session loss, and persistent refresh failure (elapsed > LOCK_TTL). `getData` checks `invalidated[userId]` and returns nil if set. | D-4 | §9 |
+| R6 | The refresh callback verifies `current._session.token == sessionTokens[userId]` and returns nil on mismatch. A nil result transitions state to "invalidated" and kicks the player. | D-5 | §7 |
+| R7 | `playerState[userId]` state machine governs all per-player operations. `addCash`/`spendCash` require state "active". `savePlayer` requires state "active"/"releasing". `releaseSession` transitions "active"→"releasing"; concurrent second call is a no-op. | Arch issue | §4 |
+| R8 | A concurrent second `loadPlayer` call for the same player (state "loading" or non-nil) is rejected immediately with a warning. It does not acquire, overwrite, or modify any existing session. | Arch issue | §5.1 |
+| R9 | A same-server session in the acquisition callback is treated as an idempotent retry **only** when `current._session.token == token`. If `current._session.jobId == JOB_ID` but `current._session.token ~= token`, the callback returns nil (another invocation on this server holds the session). | Arch issue (Issue 2) | §5.3 |
+| R10 | `_session` metadata is never present in `loadedData[userId]` or in the value returned by `getData`. It is stripped at load time and reconstructed from `current._session` inside the save callback. | Existing requirement | §2, §5.6, §6.2 |
+| R11 | Legacy records without `_session` are treated as available for acquisition. All existing game fields are preserved. `_session` is added to the record on first load without overwriting any other field. | Existing requirement | §12 |
+| R12 | A new player (no prior DataStore record) is initialized from `DEFAULT_DATA`. An existing player whose load fails (all retries exhausted, or confirmed session loss at load time) is kicked without being initialized as a new player. `loadedData[userId]` is never populated on failure. | Existing requirement | §5.5 |
+
+---
+
+## Summary of Changes from Revision 2 (88d7ff1)
+
+| Issue | Revision 2 problem | Revision 3 fix |
+|---|---|---|
+| Issue 1 — closure mutation | `sessionVerified = true` set inside UpdateAsync callback; persistent across retries | Removed. Success verified exclusively from `result._session.token == token` after pcall returns |
+| Issue 2 — same-server idempotency | `current._session.jobId == JOB_ID` allowed re-acquisition regardless of token | Idempotent retry only when `current._session.token == token`. Different token + same jobId → abort |
+| Issue 3 — mutation after ownership loss | `loadFailed` did not block `getData`; `addCash`/`spendCash` could mutate stale data | `invalidated[userId]` checked in `getData`; covers load failure AND mid-game session loss |
+| Issue 4 — save/release coordination | No formal lifecycle; `sessionTokens` clear did not prevent concurrent release calls | `playerState[userId]` state machine; "releasing" state blocks duplicate releases; in-flight saves use captured token |

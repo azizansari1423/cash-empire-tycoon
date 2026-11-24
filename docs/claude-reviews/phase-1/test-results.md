@@ -1,348 +1,372 @@
-# Phase 1 Test Results — Cash Empire Tycoon (Revised)
+# Phase 1 Test Results — Cash Empire Tycoon (Revision 3)
 
-**Date:** 2026-11-24 (revised from initial review)
-**Commit under review:** `b05aa20e3bdb82a4b842e4d1131cd11a16b37170`
-**Status:** Redesign pending; test plan covers both defects in b05aa20 and verification requirements for the revised design
+**Date:** 2026-11-24
+**Commit under review:** b05aa20 (`feature/phase-1-data-foundation`)
+**Review revision:** 3 (architecture.md, implementation-report.md, test-results.md at this commit)
+**Status:** Test plan revised — runtime tests not yet executed
 
----
-
-## Testing Constraints
-
-Cash Empire Tycoon is a Roblox game. Its server scripts run inside the Roblox engine and interact with Roblox DataStore APIs. This imposes several constraints on automated testing:
-
-- No unit test framework is configured in this project. Tools such as TestEZ exist for Roblox but have not been set up here.
-- DataStoreService is unavailable outside Roblox Studio with a live place. Calls to `GetAsync` and `UpdateAsync` fail in pure offline environments.
-- Multi-server session lock contention can only be tested using multiple Studio instances (Team Create) or a live production server.
-- No CI pipeline is configured; there are no automated test runs.
-
-**All test results below are static code analysis and logic verification only. No runtime tests have been executed. This document does not claim runtime test passage.**
+> **Note:** All test results in this document are design-level analysis. No runtime tests have been executed. Test scenarios marked PASS/FAIL reflect whether the revised design is expected to handle them correctly, not observed runtime behaviour.
 
 ---
 
-## Acceptance Criteria Verification (against b05aa20)
+## Acceptance Criteria Verification
 
-### AC-1 — New player distinguished from failed load
-
-**Requirement:** A new player (key does not exist) must never be confused with a player whose DataStore load failed.
-
-**Analysis:**
-```
-if not loadOk:
-    → loadFailed = true; kick; return nil
-elseif raw ~= nil:
-    → existing player (merge)
-else:
-    → new player (DEFAULT_DATA)
-```
-The three cases are mutually exclusive by control flow. A `pcall` failure is detected before any nil check. ✅
-
----
-
-### AC-2 — Failed load never initialized as new profile
-
-**Requirement:** When GetAsync throws, the player must not receive a fresh DEFAULT_DATA profile.
-
-**Analysis:** When `loadOk == false`, the function sets `loadFailed[userId] = true`, releases the lock, kicks the player, and returns nil before any `loadedData` assignment. ✅
-
----
-
-### AC-3 — Unverified profile cannot earn, spend, or save
-
-**Requirement:** A player whose data was not loaded successfully must not be able to modify game state.
-
-**Analysis:**
-- `addCash`: calls `getData` → returns `loadedData[userId]`; if nil → no-op. ✅
-- `spendCash`: explicit `if not data then return false end` guard. ✅
-- `savePlayer`: explicit `if loadFailed[userId] then return false end` guard. ✅
-- `TycoonManager.PlayerAdded`: `if not data then return end` after `loadPlayer`. ✅
-
-**Limitation in b05aa20:** `addCash` / `spendCash` are blocked only when `loadedData[userId] == nil`. If session ownership is lost mid-game (Defect 2), `loadedData` remains populated. The revised design sets `loadFailed[userId] = true` on session loss, which blocks saves but does NOT block `addCash` / `spendCash` (they check `getData`, not `loadFailed`). The revised design should also kick the player on session loss to stop further income accrual. ⚠️
-
----
-
-### AC-4 — No SetAsync
-
-**Requirement:** All writes to `TycoonPlayerData_v1` must use `UpdateAsync`.
-
-**Analysis:** `SetAsync` does not appear in `PlayerDataManager.lua` as of b05aa20. The only write call is `PlayerStore:UpdateAsync`. ✅
-
----
-
-### AC-5 — Session locking prevents concurrent server writes
-
-**Status:** ⚠️ Fail — Defect 1
-
-Lock acquisition is correct. However, `savePlayer` does not verify lock ownership at write time. A server whose lock has expired can overwrite a live session's data. Full scenario and fix in `architecture.md` §5.
-
----
-
-### AC-6 — No silent discard after failed save
-
-**Requirement:** A failed save must not be silently dropped.
-
-**Analysis:** `withRetry` emits a warning on every failed attempt. `savePlayer` additionally warns after `withRetry` returns false. ✅
-
----
-
-### AC-7 — `TycoonPlayerData_v1` name unchanged
-
-**Analysis:** `DataStoreService:GetDataStore("TycoonPlayerData_v1")` appears exactly once in `PlayerDataManager.lua`. ✅
-
----
-
-### AC-8 — Existing player progress preserved
-
-**Analysis:** Merge-on-load: `deepCopy(DEFAULT_DATA)` overwritten with all saved fields. Existing values take precedence; new default keys filled without touching existing ones. ✅
-
----
-
-### AC-9 — MapBuilder/TycoonManager initialization dependency
-
-**Analysis:**
-1. MapBuilder creates all 4 plots, then creates `ServerStorage.MapReady`.
-2. TycoonManager calls `ServerStorage:WaitForChild("MapReady", 30)` at module level before `PlayerAdded` is connected.
-3. `workspace:WaitForChild("Plots", 5)` resolves to the already-populated folder.
-4. All `FindFirstChild("Plots")` calls replaced with module-level `plotsFolder`.
-✅
-
----
-
-### AC-10 — Dead Heartbeat connection removed
-
-**Analysis:** `RunService.Heartbeat:Connect` does not appear in `PlayerDataManager.lua` as of b05aa20. ✅
-
----
-
-## Concurrency Scenarios
-
-The following scenarios test the session lock design. None have been executed at runtime. They are logic traces against the **revised design** (single-key fencing token) described in `architecture.md`.
-
-### Scenario C-1 — Two servers acquire session simultaneously
-
-```
-Server A: generates token T_A; UpdateAsync starts
-Server B: generates token T_B; UpdateAsync starts
-DataStore serializes: Server A's callback runs first
-  current = nil (new player or no active session)
-  → no live lock → write { _session: {token=T_A, ...} }
-Server B's callback runs second:
-  current = { _session: {jobId=A, token=T_A, since=now, released=false} }
-  jobId_A ≠ JOB_ID_B, not released, not stale → live lock → return nil
-Server B's UpdateAsync returns nil (or existing value with T_A)
-Server B: result._session.token == T_B? No → acquisition failed → kick player
-```
-
-Expected: Server A acquires; Server B kicks the player. Data safe. ✅
-
----
-
-### Scenario C-2 — Stale session takeover (Server A lock expires)
-
-```
-Server A: holds session, token T_A, since = T_0
-Server A: refresh fails (3× DataStore errors); no successful refresh for > LOCK_TTL
-Server A: loadFailed[userId] = true; kicks player (via lock-expiry logic)
-Server B: player rejoins
-  UpdateAsync: current._session.since is old (T_0 + LOCK_TTL+ elapsed)
-  → stale lock → Case B → acquire with token T_B
-Server A (if any in-flight save fires): callback reads current._session.token == T_B ≠ T_A → abort
-```
-
-Expected: Server B acquires safely. Server A's save is blocked by token mismatch. ✅
-
-**Note:** This scenario requires the refresh-failure tracking (`lastSuccessfulRefresh[userId]`) described in `architecture.md` §6.2. It is NOT present in b05aa20.
-
----
-
-### Scenario C-3 — Stale server save after session stolen
-
-```
-Server A: holds session, token T_A
-Server A: lock refresh fails once → (no kick yet; not past LOCK_TTL)
-Server B: detects stale lock after TTL; acquires with token T_B
-Server A: 60-second autosave fires
-  savePlayer callback: current._session.token == T_B ≠ T_A → sessionVerified = false → return nil
-  pcall succeeds; sessionVerified = false → confirmed session loss
-  → loadFailed[userId] = true; kick player; return false
-```
-
-Expected: Server A's save is aborted. Server B's data untouched. ✅
-
----
-
-### Scenario C-4 — Callback retry on write ack loss
-
-```
-Server A: generateToken T_A; UpdateAsync starts
-  Callback call 1: current = nil → acquire → returns { _session: {token=T_A}, ... }
-  Write goes to DataStore but ack is lost
-  Callback call 2 (retry): current = { _session: {token=T_A}, ... } (already written)
-    → current._session.jobId == JOB_ID, same server → Case B (our own lock) → re-acquire with same token
-    → returns same record
-  UpdateAsync returns
-Server A: result._session.token == T_A → acquisition confirmed
-```
-
-Expected: Callback retry is idempotent. Acquisition result is correct. ✅
-
----
-
-## Refresh Failure Scenarios
-
-### Scenario R-1 — Single transient refresh error
-
-```
-Refresh loop fires for userId
-refreshSession: pcall(UpdateAsync) → DataStore error
-No result. lastSuccessfulRefresh[userId] is recent (< LOCK_TTL ago)
-→ log warning; no kick; continue
-Next refresh fires 20s later → succeeds → lastSuccessfulRefresh updated
-```
-
-Expected: One transient failure does not trigger a kick. ✅
-
----
-
-### Scenario R-2 — Repeated refresh failures leading to lock expiry
-
-```
-3 consecutive refresh failures (network outage)
-os.time() - lastSuccessfulRefresh[userId] > LOCK_TTL (60s)
-→ The lock has certainly expired
-→ loadFailed[userId] = true; kick player
-```
-
-Expected: Player kicked before another server can steal and corrupt data. ✅
-
-**Note:** Exact threshold (number of failures vs elapsed time) must be decided at implementation; architecture.md §6.2 recommends time-based (`> LOCK_TTL since last success`) over count-based.
-
----
-
-### Scenario R-3 — Session stolen mid-game
-
-```
-Player on Server A. Server A's lock expires.
-Server B: takes over (token T_B in DataStore).
-Server A: refresh fires:
-  callback: current._session.token == T_B ≠ T_A → return nil
-  pcall succeeds; returned record token ≠ T_A → confirmed session loss
-  → loadFailed[userId] = true; kick player
-Server A: in-game income tick fires: addCash → getData → loadedData[userId] still set
-```
-
-**Gap:** `addCash` checks `getData`, not `loadFailed`. After session loss, in-memory data is stale but `addCash` still modifies it. The only practical mitigation is the kick (player is ejected and income ticks stop). The kick must fire promptly.
-
-**Mitigation in revised design:** Kick the player immediately on confirmed session loss in `refreshSession`. This stops all further in-game state modification.
-
----
-
-## Duplicate Save Prevention Scenarios
-
-### Scenario D-1 — `PlayerRemoving` and `BindToClose` both save the same player
-
-```
-Server shutdown initiated.
-PlayerRemoving fires for Player X (concurrent with BindToClose):
-
-Thread A (PlayerRemoving):
-  savePlayer(X) → UpdateAsync starts → yields
-Thread B (BindToClose task for X):
-  savePlayer(X) → loadedData[X] is set → UpdateAsync starts → yields
-
-Thread A: callback: current._session.token == T_A == sessionTokens[X] → write → success
-Thread B: callback: current._session.token == T_A == sessionTokens[X] → write same data → success (idempotent)
-
-Thread A: releaseSession(X) → captures T_A; clears sessionTokens[X] = nil; UpdateAsync → marks released
-Thread B: releaseSession(X) → reads sessionTokens[X] = nil → captures nil → callback: token ≠ nil → return nil → no-op
-```
-
-Expected: One release written. Two saves written (idempotent — same data). ✅
-
----
-
-### Scenario D-2 — `PlayerRemoving` clears `loadedData` before `BindToClose` task saves
-
-```
-Thread A (PlayerRemoving):
-  savePlayer → succeeds
-  releaseSession → succeeds
-  loadedData[X] = nil
-Thread B (BindToClose task for X):
-  savePlayer(X): loadedData[X] == nil → return false immediately
-```
-
-Expected: No second DataStore write. ✅
-
----
-
-## Shutdown Race Scenarios
-
-### Scenario S-1 — Shutdown deadline reached with in-flight save
-
-```
-BindToClose: 25s deadline starts
-Player X: save spawned; withRetry is on attempt 2 (waiting 4s backoff)
-Deadline reached: savingCount > 0
-warn("[DataManager] BindToClose: shutdown with 1 unsaved player(s)")
-Roblox terminates server process
-```
-
-Expected: Warning logged. Data may be lost for Player X. This is a known and accepted platform-level limitation. The in-flight `UpdateAsync` may or may not complete depending on whether Roblox's HTTP layer flushes before process termination.
-
----
-
-### Scenario S-2 — All players saved before deadline
-
-```
-4 players online; all spawned as concurrent save tasks
-4× UpdateAsync in parallel; all complete within 5s
-savingCount = 0 before deadline
-BindToClose completes normally
-```
-
-Expected: All players saved. No warnings. ✅
-
----
-
-## Manual Test Plan (for Studio after redesign implementation)
-
-The following scenarios should be verified in Roblox Studio after the revised `PlayerDataManager.lua` is implemented. None of these tests have been run yet. This plan is for the revised design only.
-
-| ID | Scenario | Setup | Expected Result |
-|---|---|---|---|
-| T-1 | New player first join | Delete DataStore key; join Studio | Cash=0, TotalEarned=0, all DEFAULT_DATA |
-| T-2 | Existing player rejoin | Earn cash; leave; rejoin | Cash value preserved |
-| T-3 | DataStore error on load (all retries) | Simulate via throttling plugin | Player kicked; `loadFailed = true`; no phantom save |
-| T-4 | DataStore error on load (1 transient) | Simulate 1 failure then succeed | Player loads normally after retry |
-| T-5 | Legacy record first load | Use old-format DataStore entry | All existing fields preserved; `_session` added |
-| T-6 | Session lock — concurrent join | Two Studio instances, same account | Second server kicks player |
-| T-7 | Stale lock expiry | Let lock expire (60s+), rejoin | New session acquired without false kick |
-| T-8 | Session loss during play | Manually overwrite lock in DataStore | Player kicked on next refresh; save aborted |
-| T-9 | Autosave cycle | Stay in game >60s | Cash persists; no data loss |
-| T-10 | BindToClose | Use Roblox shutdown simulation plugin | All players saved before process exit |
-| T-11 | PlayerRemoving + BindToClose race | Disconnect at same time as shutdown | One save and one release per player; no duplicate releases |
-| T-12 | GUID uniqueness in Studio | Join repeatedly in same session | Different tokens per join; `sessionTokens` updated correctly |
-| T-13 | Session ownership loss mid-game | Steal lock externally during active session | Player kicked; in-game income stops; no stale save |
-| T-14 | `_session` not exposed to game | Log `PlayerDataManager.getData(player)` | No `_session` key in output |
-| T-15 | MapBuilder race | Join immediately at server start | No nil-reference errors in output |
-
----
-
-## Summary
-
-| Category | b05aa20 Status | Revised design required? |
+| Criterion | Expected result with revised design | Requires runtime verification |
 |---|---|---|
-| New/failed load distinction | ✅ Pass | No |
-| loadFailed guard on saves | ✅ Pass | Extend: also covers session loss |
-| SetAsync removal | ✅ Pass | No |
-| Save retries | ✅ Pass | No |
-| Load retries | ❌ Fail (Defect 4) | Yes — withRetry on UpdateAsync |
-| Session lock — acquisition | ⚠️ Unsafe (Defect 3) | Yes — GUID + return-value verification |
-| Session lock — save-time verification | ❌ Fail (Defect 1) | Yes — token check in callback |
-| Refresh failure detection | ❌ Fail (Defect 2) | Yes — return-value + elapsed time check |
-| Duplicate save safety | ⚠️ Idempotent but not controlled | Acceptable; documented |
-| Shutdown race safety | ⚠️ Partial | Improved by token check |
-| _session isolation | N/A (not in b05aa20) | Yes — strip before returning |
-| MapBuilder dependency | ✅ Pass | No |
-| Heartbeat stub removal | ✅ Pass | No |
-| **Overall readiness** | **Not production-ready** | **Revision required before implementation** |
+| New player gets DEFAULT_DATA | Load path: no matching DataStore record → `rawData` empty → data = deepCopy(DEFAULT_DATA) | Yes |
+| Existing player data loaded correctly | Returned record fields merged over DEFAULT_DATA; `_session` stripped | Yes |
+| Load failure does not initialize default profile | `ok=false` or `result==nil` after all retries → `playerState="failed"`, kick; `loadedData` not populated | Yes |
+| Session lock prevents duplicate writes | Save callback: `current._session.token ~= token` → return nil → no write | Yes |
+| Stale lock (TTL expired) allows new server to acquire | Acquisition callback: `(now - sess.since) >= LOCK_TTL` → available for acquisition | Yes |
+| `addCash`/`spendCash` blocked after session loss | `invalidated[userId]=true` → `getData` returns nil → operations return false/nil | Yes |
+| `releaseSession` called twice is a no-op | State "releasing"/"released" → `releaseSession` returns without action | Yes |
+| BindToClose completes within 25 s deadline | Parallel saves with `task.wait(0.1)` poll; deadline enforced | Yes |
+| Legacy records (no `_session`) load correctly | Acquisition callback: `current._session == nil` → treated as available; all existing fields preserved | Yes |
+| `_session` never in `getData` return value | `loadedData[userId]` populated without `_session` at load time; `getData` returns that table | Yes |
+
+---
+
+## Scenario Tests
+
+### Callback Retry After Ownership Change (NEW — Issue 1)
+
+**Scenario CR-1: Save callback retried after session theft**
+
+```
+Setup:    Server A holds session, token T_A. Server B acquires session (token T_B in DataStore).
+          Server A's UpdateAsync save yields during write; Roblox retries callback.
+Step 1:   Callback call 1: current._session.token == T_A → match → returns newRecord
+Step 2:   Write ack lost (partition). DataStore has T_A record from call 1.
+Step 3:   Server B: loadPlayer → UpdateAsync → sees T_A, TTL not met → waits.
+          (Assume T_A TTL expires; Server B acquires with T_B.)
+Step 4:   Roblox retries Server A callback: current._session.token == T_B ≠ T_A → return nil
+Step 5:   UpdateAsync returns nil (ok=true, result=nil).
+Step 6:   Outer code: result == nil → confirmedSessionLoss = true (set outside callback) → break
+Step 7:   playerState = "invalidated"; invalidated[userId] = true; player kicked.
+Expected: Server A's stale data is NOT written. Server B's session intact. DESIGN: PASS
+```
+
+**Scenario CR-2: Acquisition callback retried after own write (idempotent)**
+
+```
+Setup:    Server A: loadPlayer, token T_A. First callback call writes T_A to DataStore. Ack lost.
+Step 1:   Roblox retries acquisition callback.
+Step 2:   current._session.token == T_A == token (ourRetry = true) → callback re-writes same record.
+Step 3:   UpdateAsync returns record with T_A.
+Step 4:   Verification: result._session.token == T_A == token → acquisition confirmed.
+Expected: Idempotent retry succeeds. Data loaded normally. DESIGN: PASS
+```
+
+**Scenario CR-3: Acquisition callback retried — another server intervened between calls**
+
+```
+Setup:    Server A: loadPlayer, token T_A. Call 1: sess absent → callback writes T_A. Ack lost.
+          Server B: loadPlayer, token T_B. UpdateAsync runs; sees T_A (live); T_A TTL not expired.
+          Server B callback: sess.jobId ≠ JOB_ID_B → Server B aborts → Server B kicks its player.
+Step 1:   Roblox retries Server A callback: current._session.token == T_A == token → ourRetry = true
+Step 2:   re-writes same record; UpdateAsync returns T_A record.
+Step 3:   Server A: verification passes; session acquired.
+Expected: Server A retains session. Server B correctly aborted. DESIGN: PASS
+```
+
+---
+
+### Duplicate Same-Server Load (NEW — Issue 2)
+
+**Scenario DS-1: Two concurrent loadPlayer calls for the same player**
+
+```
+Setup:    Server: playerState[X] = nil.
+Thread 1: loadPlayer(X) → token T_A generated → playerState[X] = "loading" → UpdateAsync yields
+Thread 2: loadPlayer(X) → playerState[X] == "loading" → warn + return nil immediately
+Step 1:   Thread 1 UpdateAsync completes; session acquired with T_A.
+Step 2:   playerState[X] = "active"; sessionTokens[X] = T_A.
+Step 3:   Thread 2 returns nil — no session acquired, no data loaded, no token stored.
+Expected: Exactly one session acquired. Thread 2 is a safe no-op. DESIGN: PASS
+```
+
+**Scenario DS-2: Same-server acquisition with different token (stale entry from prior crash)**
+
+```
+Setup:    Server crashed and restarted (same game.JobId in Studio; different jobId in prod).
+          DataStore has {_session: {jobId: JOB_ID, token: T_OLD}} from crashed session.
+          New loadPlayer: token T_NEW generated.
+Step 1:   Callback: current._session.jobId == JOB_ID, current._session.token == T_OLD ≠ T_NEW.
+Step 2:   ourRetry = (T_OLD == T_NEW) = false.
+Step 3:   anotherServer = (T_OLD.jobId ≠ JOB_ID) = false (same server).
+Step 4:   Same-server different-token branch: return nil.
+Step 5:   UpdateAsync returns nil; outer code: confirmed failure → kick "active on another server".
+Note:     In production, job IDs differ between instances, so T_OLD session appears as
+          "another server." Same-job-ID case only occurs in Studio. Studio has LOCK_TTL=60s;
+          if the old session's `since` is > 60s ago, TTL check passes and acquisition proceeds.
+Expected: Either kicked (session live, TTL not expired) or acquired (session expired). DESIGN: PASS
+```
+
+**Scenario DS-3: Same-server different-token — TTL expired**
+
+```
+Setup:    DataStore has {_session: {jobId: JOB_ID, token: T_OLD, since: 100s ago}}.
+          LOCK_TTL = 60s. New loadPlayer: token T_NEW.
+Step 1:   Callback: sess.jobId == JOB_ID, sess.token ≠ T_NEW.
+          anotherServer check: sess.jobId == JOB_ID → anotherServer = false.
+          TTL check: (now - sess.since) = 100 > 60 → session expired.
+Step 2:   Expired session: treat as available → write new session with T_NEW.
+Expected: Session acquired normally. DESIGN: PASS
+Note:     The same-server-different-token branch only blocks when TTL is live. Expired sessions
+          fall through to the standard "available" path.
+```
+
+---
+
+### Mutation After Ownership Loss (NEW — Issue 3)
+
+**Scenario ML-1: `addCash` called after session theft detected during refresh**
+
+```
+Setup:    Server A holds session. 3 refresh failures; os.time()-lastRefresh[X] > LOCK_TTL.
+Step 1:   refreshSession detects expiry; invalidated[X] = true; playerState[X] = "invalidated".
+          player:Kick() called (kick delivery takes a few yields).
+Step 2:   Income tick fires between invalidation and kick delivery:
+          addCash(X, 100) → getData(X) → invalidated[X]==true → return nil
+          addCash: data == nil → early return; no mutation. PASS
+Step 3:   spendCash(X, 50) → getData(X) → nil → return false. PASS
+Step 4:   Player is kicked. Income ticks stop.
+Expected: No mutation to stale in-memory profile after ownership loss. DESIGN: PASS
+```
+
+**Scenario ML-2: `addCash` called after `loadPlayer` returned nil (failed load)**
+
+```
+Setup:    loadPlayer fails all retries; playerState[X]="failed"; invalidated[X]=true; loadedData[X]=nil.
+          Game code calls addCash before kick is delivered.
+Step 1:   addCash(X, 100) → getData(X) → invalidated[X]=true → return nil → addCash: no-op. PASS
+Expected: No mutation. DESIGN: PASS
+```
+
+**Scenario ML-3: `getData` called in state "releasing" (valid — PlayerRemoving path)**
+
+```
+Setup:    PlayerRemoving fires; releaseSession transitions to "releasing".
+          Some code calls getData during release (e.g., a final balance check).
+Step 1:   getData: playerState[X] == "releasing" → allowed → returns loadedData[X].
+Expected: getData returns valid data during graceful release path. DESIGN: PASS
+```
+
+---
+
+### Save/Release Concurrency (NEW — Issue 4)
+
+**Scenario SR-1: Autosave in-flight when PlayerRemoving fires**
+
+```
+Setup:    Autosave thread for X: state=="active" ✓; token=T_A captured; UpdateAsync yields.
+          PlayerRemoving fires.
+Step 1:   releaseSession: state=="active" → "releasing"; sessionTokens[X]=nil; token T_A captured locally.
+Step 2:   DataStore: autosave callback runs first.
+          current._session.token == T_A (token captured, still matches DataStore) → writes data. PASS
+Step 3:   Release UpdateAsync runs: current._session.token == T_A → marks released=true. PASS
+Step 4:   State → "released". loadedData[X] = nil.
+Expected: Data saved exactly once; session released exactly once. DESIGN: PASS
+```
+
+**Scenario SR-2: New save attempt after `sessionTokens` cleared**
+
+```
+Setup:    releaseSession in progress; sessionTokens[X] = nil.
+          A second autosave fires.
+Step 1:   savePlayer: playerState[X] == "releasing" → check passes (releasing allows saves).
+Step 2:   local token = sessionTokens[X] → nil.
+Step 3:   if token == nil: return false immediately. PASS
+Expected: Second save rejected before any DataStore call. DESIGN: PASS
+```
+
+**Scenario SR-3: Both PlayerRemoving and BindToClose call releaseSession**
+
+```
+Setup:    Server shutdown: PlayerRemoving and BindToClose both fire for Player X.
+Step 1:   Thread A (PlayerRemoving): releaseSession → state "active" → "releasing"; token T_A captured.
+Step 2:   Thread B (BindToClose): releaseSession → state == "releasing" → no-op; returns. PASS
+Step 3:   Thread A release UpdateAsync → state → "released". PASS
+Expected: Exactly one release written. No duplicate state transition. DESIGN: PASS
+```
+
+**Scenario SR-4: Release UpdateAsync fails all retries**
+
+```
+Setup:    PlayerRemoving fires; releaseSession starts; all 3 release UpdateAsync attempts fail.
+Step 1:   released = false after loop.
+Step 2:   warn("Release failed for userId=X. Lock will expire after 60s.").
+Step 3:   playerState[X] = "released" (unconditional).
+Step 4:   activeLocks[X] was cleared in releaseSession — refresh loop no longer refreshes X's session.
+Step 5:   DataStore: X's session TTL counts down from last successful refresh.
+Step 6:   After LOCK_TTL=60s, session expires → available for acquisition on rejoin.
+Expected: Session expires via TTL. No permanent lock. DESIGN: PASS (with 60s delay before rejoin)
+```
+
+**Scenario SR-5: `savePlayer` called after state is "released"**
+
+```
+Setup:    PlayerRemoving has completed; state = "released"; loadedData[X] = nil.
+          BindToClose fires and tries savePlayer(X).
+Step 1:   savePlayer: playerState[X] == "released" → not "active"/"releasing" → return false. PASS
+Expected: No DataStore call. DESIGN: PASS
+```
+
+---
+
+### Concurrency Scenarios (from previous revision, updated)
+
+**Scenario C-1: Normal acquire → save → release**
+
+```
+Expected: acquisition confirmed by token match; save confirmed by token match; release marks released=true.
+State transitions: nil→loading→active→releasing→released. DESIGN: PASS
+```
+
+**Scenario C-2: Two servers attempt simultaneous acquisition**
+
+```
+Server A: token T_A. Server B: token T_B.
+DataStore serializes. Server A wins: writes T_A. Server B callback: T_A ≠ T_B, TTL live → return nil.
+Server B: result==nil → kick. Server A: result._session.token==T_A → acquired.
+DESIGN: PASS
+```
+
+**Scenario C-3: Server B acquires after Server A disconnects (TTL expiry)**
+
+```
+Server A disconnects without releasing. After 60s, T_A's `since` is > LOCK_TTL.
+Server B: acquisition callback: (now - sess.since) >= LOCK_TTL → available → writes T_B.
+Server B: result._session.token == T_B → acquired.
+DESIGN: PASS
+```
+
+**Scenario C-4: Server A refresh races with Server B acquisition**
+
+```
+Server A: refreshSession UpdateAsync yields. Server B: loadPlayer UpdateAsync yields.
+Case 1: Server A refresh wins. Server B sees T_A with fresh `since` → TTL live → Server B aborts.
+Case 2: Server B acquires first (T_B in DataStore). Server A refresh callback: T_A ≠ T_B → nil.
+        Server A: refresh returns nil → invalidated[X]=true → Server A kicks its player.
+DESIGN: PASS (both orderings handled)
+```
+
+---
+
+### Refresh Failure Scenarios
+
+**Scenario R-1: Single transient refresh failure**
+
+```
+Refresh attempt fails (DataStore error). os.time()-lastRefresh[X] = 15s < LOCK_TTL(60s).
+→ log warning; no invalidation. Next scheduled refresh in 20s will retry.
+DESIGN: PASS
+```
+
+**Scenario R-2: Three consecutive refresh failures — TTL not yet expired**
+
+```
+3 refresh errors over 60s. lastRefresh[X] updated from last SUCCESS (prior cycle).
+If (now - lastRefresh[X]) < LOCK_TTL → warn but no invalidation yet.
+If (now - lastRefresh[X]) >= LOCK_TTL → invalidated; kick.
+DESIGN: PASS
+```
+
+**Scenario R-3: Refresh detects stolen session (token mismatch)**
+
+```
+Callback: current._session.token ≠ sessionTokens[X] → return nil.
+Outer: result == nil → invalidated[X]=true; playerState="invalidated"; player kicked.
+DESIGN: PASS
+```
+
+---
+
+### Duplicate Save Scenarios
+
+**Scenario D-1: Autosave + PlayerRemoving save (normal path)**
+
+Both saves: state=="active"/"releasing"; token T_A captured; both UpdateAsync calls serialized by DataStore.
+Both callbacks match T_A → both writes succeed (second is idempotent — same token, same data).
+DESIGN: PASS
+
+**Scenario D-2: Autosave after session invalidated**
+
+```
+Session loss detected; invalidated[X]=true; state="invalidated".
+Autosave: savePlayer → state check: "invalidated" ≠ "active"/"releasing" → return false. PASS
+```
+
+---
+
+### Shutdown Scenarios
+
+**Scenario S-1: Normal shutdown (PlayerRemoving completes before BindToClose)**
+
+```
+PlayerRemoving: save + release → state "released"; loadedData[X]=nil.
+BindToClose: savePlayer → state "released" → return false. releaseSession → state ≠ "active" → no-op.
+DESIGN: PASS
+```
+
+**Scenario S-2: Rapid shutdown (BindToClose fires before PlayerRemoving completes)**
+
+```
+BindToClose: savePlayer(X) starts; token T_A captured; UpdateAsync yields.
+PlayerRemoving: releaseSession → state "active"→"releasing"; sessionTokens[X]=nil; T_A captured.
+BindToClose save callback: T_A matches DataStore → writes data. PASS
+PlayerRemoving release callback: T_A matches → marks released=true. PASS
+DESIGN: PASS
+```
+
+---
+
+## Manual Test Plan (Pre-Implementation Checklist)
+
+The following tests must be executed in Roblox Studio after implementation. None have been run against the current codebase.
+
+| # | Test | Setup | Expected | Fail indicator |
+|---|---|---|---|---|
+| T-01 | New player load | Player with no prior data joins | DEFAULT_DATA returned; `_session` not in getData result | Error or nil from loadPlayer |
+| T-02 | Returning player load | Player with saved data joins | Saved values loaded; new default fields added | Missing fields or wrong values |
+| T-03 | DataStore unavailable on load | Disable Studio network | Player kicked; loadedData not populated | Player initialized with defaults |
+| T-04 | Concurrent sessions (two Studio instances) | Two servers, same userId | Second server kicked on acquisition attempt | Both servers show player active |
+| T-05 | TTL expiry allows rejoin | Kill first server without release; wait 60s | Second server acquires session normally | Second server kicked ("active on another server") |
+| T-06 | Save preserves correct data | addCash(100); savePlayer; reload | Cash == 100 after reload | Cash == 0 or wrong value |
+| T-07 | Save blocked after session loss | Simulate stolen session; trigger autosave | savePlayer returns false; player kicked | Save succeeds after session loss |
+| T-08 | addCash blocked after session loss | Simulate stolen session; call addCash | addCash is a no-op; Cash unchanged | Cash increases after session loss |
+| T-09 | spendCash blocked after session loss | Simulate stolen session; call spendCash | spendCash returns false | spendCash returns true |
+| T-10 | Duplicate loadPlayer call | Call loadPlayer twice quickly (same player) | Second call returns nil with warning | Second call acquires session / overwrites first |
+| T-11 | Release on PlayerRemoving | Player leaves normally | Session marked released=true in DataStore | Session not released (requires Studio DataStore viewer) |
+| T-12 | Release idempotency | PlayerRemoving + BindToClose both fire | Exactly one release write; no duplicate token mismatch error | Error from second release or corrupted state |
+| T-13 | BindToClose 25s deadline | 2+ players; slow DataStore | All saves attempted; server shuts down within 25s | Server hangs indefinitely |
+| T-14 | Legacy data backward compat | Existing player record (no `_session` field) | Record loaded; all fields preserved; `_session` added | Data loss or load failure |
+| T-15 | `_session` isolation | Inspect getData return value | No `_session` key in returned table | `_session` present in getData result |
+| T-16 | Callback retry idempotency | Inject artificial Roblox retry (Studio debug) | Acquisition succeeds if token matches; aborts if token differs | Incorrect session state after retry |
+| T-17 | Refresh detects stolen session | While player is active, manually write another token to DataStore | Player kicked on next refresh cycle | Player continues playing with stale session |
+| T-18 | TTL-expired same-server session | Studio: same JobId; write old session with `since` > 60s ago | New load acquires session | Kicked as "active on another server" |
+
+---
+
+## Tests Added for the Four Issues (Architecture Revision 3)
+
+| Test | Issue covered | Scenario reference |
+|---|---|---|
+| Callback retried after ownership change | Issue 1 — no closure mutation | CR-1 |
+| Acquisition callback retried — idempotent | Issue 1 | CR-2 |
+| Acquisition callback retried — another server intervened | Issue 1 | CR-3 |
+| Duplicate same-server loadPlayer call | Issue 2 — same-server idempotency | DS-1 |
+| Same-server different-token (live TTL) | Issue 2 | DS-2 |
+| Same-server different-token (expired TTL) | Issue 2 | DS-3 |
+| addCash blocked after refresh detects session loss | Issue 3 — mutation after ownership loss | ML-1 |
+| addCash blocked after failed load | Issue 3 | ML-2 |
+| getData allowed in "releasing" state | Issue 3 | ML-3 |
+| In-flight save + concurrent release | Issue 4 — save/release coordination | SR-1 |
+| New save attempt after sessionTokens cleared | Issue 4 | SR-2 |
+| Duplicate releaseSession from PlayerRemoving + BindToClose | Issue 4 | SR-3 |
+| Release UpdateAsync fails all retries — TTL safety net | Issue 4 | SR-4 |
+| savePlayer called after "released" state | Issue 4 | SR-5 |
+| T-10 (manual) | Issue 2 | DS-1 |
+| T-16 (manual) | Issue 1 | CR-1, CR-2 |
+| T-17 (manual) | Issue 3 | ML-1 |
+| T-18 (manual) | Issue 2 | DS-3 |
