@@ -1,8 +1,8 @@
-# Phase 1 Test Results — Cash Empire Tycoon (Revision 9)
+# Phase 1 Test Results — Cash Empire Tycoon (Revision 10)
 
 **Date:** 2026-11-24
 **Commit under review:** b05aa20 (`feature/phase-1-data-foundation`)
-**Review revision:** 9
+**Review revision:** 10
 **Status:** Test plan revised — runtime tests not yet executed
 
 > **Note:** All test results in this document are design-level analysis. No runtime tests have been executed. Test scenarios marked PASS/FAIL reflect whether the revised design is expected to handle them correctly, not observed runtime behaviour.
@@ -21,7 +21,7 @@
 | `addCash`/`spendCash` blocked after session loss | `invalidated[userId]=true` → `getData` returns nil → operations return false/nil | Yes |
 | Duplicate disconnect ownership rejected | `shuttingDown[userId]` guard: first caller owns lifecycle; second (observing) caller performs two-phase wait: (1) until `shuttingDown` clears, (2) until `inFlightSaves == 0` — `disconnectCount` decremented only after both phases (R26) | Yes |
 | BindToClose completes within 25 s deadline | Each player gets a concurrent `task.spawn(disconnectPlayer)`; observers use two-phase wait; counter reflects actual save completion; 25 s outer deadline provides exit if saves never complete (logs warning, allows shutdown) | Yes |
-| Player can rejoin same server after disconnect | `playerState[userId]` is cleared to nil after all async ops complete; `loadPlayer` accepts nil state (R24); stale refresh from old session cannot invalidate new session (R23) | Yes |
+| Player can rejoin same server after disconnect | `playerState[userId]` is cleared to nil after all async ops complete; `loadPlayer` accepts nil state (R24); stale refresh from old session cannot invalidate new session (R23); stale autosave from old session cannot invalidate new session via §6.3 dual identity check (R28/R29/R30) | Yes |
 | Legacy records (no `_session`) load correctly | Acquisition callback: `current._session == nil` → treated as available; all existing fields preserved | Yes |
 | `_session` never in `getData` return value | `loadedData[userId]` populated without `_session` at load time; `getData` returns that table | Yes |
 
@@ -568,13 +568,96 @@ Data loss documented as degraded-path outcome.
 DESIGN: PASS (degraded path with correct logging)
 ```
 
+**Scenario DT-1: T_A autosave succeeds after drain timeout; old session cleaned up; T_B rejoin succeeds (NEW — Revision 10, D-20)**
+
+See Timeline I (updated) for detailed step-by-step. Summary:
+
+```
+Drain timeout: playerState[X]="abandoned"; inFlightSaves[X]=1; sessionTokens[X]=T_A (preserved).
+Autosave completes; callback: current._session.token==T_A → data written.
+§6.3 Step 1: inFlightSaves→0. Step 2: sessionTokens==T_A==capturedToken → passes.
+Step 3: confirmedSessionLoss=false → skip. Step 4: abandoned AND counter==0
+→ sessionTokens=nil; playerState=nil. ✅ T_B rejoin: loadPlayer → playerState==nil → allowed. ✅
+DESIGN: PASS
+```
+
+**Scenario DT-2: T_A autosave detects token mismatch after drain timeout; T_B not invalidated or kicked (NEW — Revision 10, D-20)**
+
+See Timeline K for detailed step-by-step. Summary:
+
+```
+Drain timeout: playerState[X]="abandoned"; sessionTokens[X]=T_A.
+Autosave confirms session loss (DataStore has another token).
+§6.3 Step 1: inFlightSaves→0. Step 2: sessionTokens==T_A==capturedToken → passes.
+Step 3: confirmedSessionLoss=true; playerState=="abandoned" (NOT "active")
+→ warn log; skip invalidation; skip kick. Step 4: abandoned AND counter==0
+→ sessionTokens=nil; playerState=nil. ✅
+
+Broken (Revision 9): confirmedSessionLoss fired → playerState="invalidated" →
+drain-timeout cleanup skipped → playerState stayed "invalidated" forever → rejoin blocked. ← D-20
+DESIGN: PASS (Revision 10)
+```
+
+**Scenario DT-3: T_A autosave exhausts DataStore retries after drain timeout; T_B not affected (NEW — Revision 10, D-20)**
+
+```
+Drain timeout: playerState[X]="abandoned"; inFlightSaves[X]=1; sessionTokens[X]=T_A.
+Autosave: all SAVE_RETRIES fail (DataStore errors only). saveSucceeded=false; confirmedSessionLoss=false.
+§6.3 Step 1: inFlightSaves→0. Step 2: sessionTokens==T_A → passes.
+Step 3: confirmedSessionLoss=false → skip. Step 4: abandoned AND counter==0
+→ sessionTokens=nil; playerState=nil. warn "all retries exhausted". ✅
+T_B rejoin proceeds; session expires by TTL.
+DESIGN: PASS
+```
+
+**Scenario DT-4: T_A completion races with T_B load; T_B cannot start until T_A safely relinquishes state (NEW — Revision 10, D-20)**
+
+```
+Proof that the §5.1 ordering invariant prevents the race:
+§5.1: loadPlayer rejects if playerState[X] ~= nil.
+In drain-timeout path: playerState[X]="abandoned" (non-nil) until §6.3 Step 4 clears it.
+§6.3 Step 4 fires only AFTER Step 1 (decrement) completes — i.e., after T_A's save finishes.
+Therefore: T_B cannot call loadPlayer until T_A's §6.3 Step 4 has run.
+By that point: T_A's sessionTokens[X] is nil; inFlightSaves[X] is 0.
+T_B starts with a clean slate; T_A's counter slot cannot affect T_B's accounting.
+
+Invariant: "T_B never starts while T_A's inFlightSaves slot is live."
+DESIGN: PASS (structural guarantee from §5.1 + §6.3 ordering)
+```
+
+**Scenario DT-5: Stale T_A save completion after T_B is fully active; Step-2 identity check blocks T_A (NEW — Revision 10, D-20)**
+
+See Timeline L for detailed step-by-step. Summary:
+
+```
+T_B active: playerState[X]="active"; sessionTokens[X]=T_B.
+T_A's very-late save fires (edge case — normal path, not drain-timeout).
+§6.3 Step 1: inFlightSaves[X] decremented.
+§6.3 Step 2: sessionTokens[X]==T_B ≠ capturedToken(T_A) → stale completion → return false. ✅
+T_B state untouched; no invalidation, no kick.
+DESIGN: PASS (defence-in-depth; §5.1+two-phase-wait prevent this in practice)
+```
+
+**Scenario DT-6: BindToClose observer waits correctly for old save; 25-second deadline applies (NEW — Revision 10, D-20)**
+
+Already covered by BC-2 (normal drain-timeout, Phase-2 wait) and BC-5 (25s deadline). The D-20 fix ensures that Phase-2 properly drains the old save and that §6.3 clears state correctly when the save completes. No additional scenario needed beyond BC-2/BC-5; referenced here for traceability.
+
+```
+See BC-2: Phase-2 loops on inFlightSaves while T_A's autosave is in flight.
+See BC-5: 25s deadline fires if Phase-2 never exits; degraded path logged.
+D-20 connection: §6.3 (not Phase-2) is what actually clears playerState=nil when the
+save completes. Phase-2 observes inFlightSaves dropping to 0, which is set by §6.3 Step 1.
+DESIGN: PASS (combined BC-2/BC-5 coverage, updated §6.3 handling)
+```
+
 ---
 
 **Scenario SR-1: Autosave in-flight when PlayerRemoving fires (updated for Revision 6)**
 
 ```
 Setup:    Autosave in flight (inFlightSaves[X]=1; snapshot_T0 captured). PlayerRemoving fires.
-Step 1:   disconnectPlayer(X): shuttingDown[X]=true; sessionTokens[X]=nil; drain wait.
+Step 1:   disconnectPlayer(X): shuttingDown[X]=true; activeLocks[X]=nil; drain wait.
+          (sessionTokens[X] NOT cleared in step 2 — D-20 fix.)
 Step 2:   Autosave completes; inFlightSaves[X]=0 → drain passes.
 Step 3:   snapshot_T1=deepCopy(loadedData[X]) taken (most recent data after drain).
           disconnectSave(X, player, T_A, snapshot_T1); inFlightSaves[X]=1; UpdateAsync.
@@ -779,6 +862,19 @@ The following tests must be executed in Roblox Studio after implementation. None
 | T-18 | TTL-expired same-server session | Studio: same JobId; write old session with `since` > 60s ago | New load acquires session | Kicked as "active on another server" |
 
 ---
+
+## Tests Added for Revision 10 (Architecture Issue D-20)
+
+| Test | Issue covered | Scenario reference |
+|---|---|---|
+| T_A autosave succeeds after drain timeout; session cleaned up; T_B rejoin succeeds | D-20 — §6.3 Step 4 drain-timeout cleanup | DT-1 (new), Timeline I (updated) |
+| T_A autosave confirms session loss (token mismatch) after drain timeout; no invalidation; no kick; rejoin enabled | D-20 — §6.3 Step 3 state-conditional; Step 4 cleanup | DT-2 (new), Timeline K |
+| T_A autosave exhausts retries after drain timeout; confirmedSessionLoss=false; cleanup clears state | D-20 | DT-3 (new) |
+| §5.1 ordering invariant proves T_B cannot start while T_A's inFlightSaves slot is live | D-20 — counter ownership proof | DT-4 (new) |
+| Stale T_A save completion after T_B active; Step-2 identity check blocks T_A (defence-in-depth) | D-20 — §6.3 Step 2 dual identity check | DT-5 (new), Timeline L |
+| BindToClose observer waits correctly for old save; 25s deadline applies (traceability to D-20) | D-20 | DT-6 (references BC-2/BC-5) |
+| SR-1 updated: sessionTokens NOT cleared in disconnectPlayer step 2 (D-20 fix) | D-20 | SR-1 (updated) |
+| All timelines (A/B/C/D/E/F/G/H/I) updated: sessionTokens cleared in step 7 / §6.3, not step 2 | D-20 | Timelines A–L (updated) |
 
 ## Tests Added for Revision 9 (Architecture Issues D-17, D-18, D-19)
 

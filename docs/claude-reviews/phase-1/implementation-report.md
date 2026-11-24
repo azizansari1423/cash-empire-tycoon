@@ -1,9 +1,9 @@
-# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 9)
+# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 10)
 
 **Date:** 2026-11-24
 **Branch:** `feature/phase-1-data-foundation` (commit b05aa20)
 **Review branch:** `claude-review/phase-1`
-**Status:** Revision 9 — pending approval before implementation
+**Status:** Revision 10 — pending approval before implementation
 
 ---
 
@@ -489,3 +489,72 @@ Timelines C and D (Revision 8) showed the observer looping, which was correct. B
 | D-17 — BindToClose premature completion during drain-timeout | Observing caller's Phase-1 wait exited when shuttingDown cleared; autosave still in flight; disconnectCount decremented prematurely | Two-phase wait: Phase 1 (shuttingDown), then Phase 2 (inFlightSaves == 0); counter decremented only after both phases |
 | D-18 — async operation tracking undocumented | No explicit statement of which operations must drain vs may safely outlive cleanup | §10.1 table: saves tracked/must drain; refresh tasks untracked/safe to outlive (dual identity check justification) |
 | D-19 — contradictory §10 introduction | §10 intro said "other returns immediately"; §10.3 and timelines showed waiting | §10 intro corrected to describe two-phase wait; all timelines consistent |
+
+---
+
+## Defects Found in Revision 9 Architecture (c10bd86)
+
+### D-20: Drain-timeout autosave completion handler has an unresolved state-transition race (CRITICAL)
+
+**File:** `PlayerDataManager.lua` (design)
+
+The §6.3 completion handler in Revision 9 applies `"invalidated"` state without checking:
+
+1. **No dual identity check on the save path.** The captured `token` (local variable in `savePlayer`) is never compared against `sessionTokens[userId]` in the completion handler. If a new session T_B has started on the same server, T_A's save completion can still apply state transitions to T_B.
+
+2. **`confirmedSessionLoss` fires unconditionally regardless of `playerState`.** In the drain-timeout path, `playerState[userId] == "abandoned"` when the autosave eventually completes. The existing code sets `playerState[userId] = "invalidated"` without checking whether the session is still active. This turns "abandoned" → "invalidated", a non-nil terminal state that blocks rejoin permanently.
+
+3. **`disconnectPlayer` step 2 clears `sessionTokens[userId] = nil` before the drain wait.** This means that by the time the drain-timeout autosave completes in §6.3, `sessionTokens[userId]` is `nil` — making a token-based identity check impossible. Even if a check were added, `nil ≠ capturedToken` would always fire, causing §6.3 to silently return false without clearing `playerState` to nil — permanently blocking the userId.
+
+**Failure scenario:**
+
+```
+T_A autosave in flight during drain-timeout.
+disconnectPlayer clears sessionTokens[X]=nil (step 2).
+Autosave completes after drain-timeout: confirmedSessionLoss=true (DataStore has another token).
+§6.3 (Revision 9): confirmedSessionLoss fires → playerState[X]="invalidated".
+§6.3 drain-timeout cleanup: playerState != "abandoned" → not triggered.
+Result: playerState[X]="invalidated" permanently. Same-server rejoin blocked forever. ← D-20
+```
+
+**Additional failure — T_A success path with T_B active:**
+
+If `sessionTokens[userId]` is preserved (not cleared in step 2), and T_B starts between T_A's save and its completion (impossible per §5.1 ordering, but as a defence-in-depth concern), T_A's `confirmedSessionLoss=false` path would reach the drain-timeout cleanup check. If `playerState == "active"` (T_B active), the check `playerState == "abandoned"` would fail and fall through to the normal return — harmless but correct to guard explicitly.
+
+**Fix:**
+
+1. **Preserve `sessionTokens[userId]` through `disconnectPlayer` step 2.** Do not clear it before the drain wait. Autosaves are blocked by the `playerState == "active"` state guard; the token clearing in step 2 is redundant for new-save blocking and harmful for the §6.3 identity check.
+
+2. **Add a dual identity check as Step 2 of §6.3:** `if sessionTokens[userId] ~= token: return false`. This prevents any stale T_A completion from modifying T_B state.
+
+3. **State-conditional session-loss handling (Step 3):** `confirmedSessionLoss` applies invalidation only when `playerState[userId] == "active"`. When state is `"abandoned"` or `"disconnecting"`, log a warning and fall through to cleanup — no kick, no invalidation.
+
+4. **Drain-timeout cleanup as Step 4:** Clear `sessionTokens[userId] = nil` and `playerState[userId] = nil` when `playerState == "abandoned"` and `inFlightSaves == 0`. This is the only point where `sessionTokens` is cleared in the drain-timeout path.
+
+5. **Clear `sessionTokens[userId]` in step 7 (normal / save-failed cleanup).** Since step 2 no longer clears it, step 7 must.
+
+**Ordering invariant:**
+
+Decrement first → identity check → state-conditional session-loss → drain-timeout cleanup → normal return.
+
+See architecture §6.3, §10.1 step 2, §10.1 step 7, Timelines E/G/H/I/K/L (Revision 10).
+
+---
+
+## Revised Requirements (Revision 10 additions)
+
+| ID | Requirement | Source defect | Architecture section |
+|---|---|---|---|
+| R28 | `savePlayer`'s §6.3 completion handler must apply a dual identity check (`sessionTokens[userId] == token`, the captured value) before modifying any per-player state. If the check fails (new session T_B active, or state fully cleaned up), the completion must return false without modifying `playerState`, `invalidated`, or calling `Kick`. The decrement (Step 1) is still performed unconditionally before the check. | D-20 | §6.3 |
+| R29 | `savePlayer`'s `confirmedSessionLoss` branch must check `playerState[userId]` before invalidating: (a) if `playerState == "active"`, apply invalidation and kick as before; (b) if `playerState == "abandoned"` or `"disconnecting"`, log a warning and fall through to drain-timeout cleanup without setting `"invalidated"`. Drain-timeout cleanup (playerState == "abandoned" AND inFlightSaves == 0 after decrement) clears `sessionTokens[userId] = nil` and `playerState[userId] = nil`. | D-20 | §6.3 |
+| R30 | `disconnectPlayer` step 2 must NOT clear `sessionTokens[userId] = nil`. `sessionTokens` must remain set to the session token until step 7 cleanup (normal / save-failed paths) or until §6.3 Step 4 (drain-timeout path). This preserves the dual identity check in §6.3 for the full period that in-flight saves from the old session may complete. | D-20 | §10.1 step 2, §10.1 step 7 |
+
+---
+
+## Summary of Changes from Revision 9 (c10bd86)
+
+| Issue | Revision 9 problem | Revision 10 fix |
+|---|---|---|
+| D-20 — §6.3 `confirmedSessionLoss` unconditionally sets "invalidated" | No dual identity check on save completion; `confirmedSessionLoss` fired regardless of playerState; "abandoned" → "invalidated" blocked rejoin permanently | Dual identity check (sessionTokens==capturedToken) added as Step 2; Step 3 applies invalidation only when state=="active"; Step 4 drain-timeout cleanup clears sessionTokens+playerState when abandoned+counter==0 |
+| D-20 — `sessionTokens` cleared in step 2 prevented §6.3 identity check | `disconnectPlayer` cleared `sessionTokens[userId]=nil` before drain wait; §6.3 saw nil, identity check always failed, state never cleared → permanent block | Step 2 no longer clears sessionTokens; Step 7 cleanup and §6.3 Step 4 clear it at the correct point |
+| D-20 — `player:Kick()` called without nil check | §6.3 used the outer `player` parameter, which may be nil if the player left before the save completed | Changed to `Players:GetPlayerByUserId(tonumber(userId))` with nil check before kick |

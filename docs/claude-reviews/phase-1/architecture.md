@@ -1,8 +1,8 @@
-# Phase 1 Architecture — Cash Empire Tycoon (Revision 9)
+# Phase 1 Architecture — Cash Empire Tycoon (Revision 10)
 
 **Date:** 2026-11-24
 **Scope:** `PlayerDataManager.lua` session locking design
-**Status:** Revision 9 — pending approval before implementation
+**Status:** Revision 10 — pending approval before implementation
 
 ---
 
@@ -113,6 +113,8 @@ session loss   disconnectPlayer called
 - `"released" → nil` / `"abandoned" → nil`: cleared explicitly by `disconnectPlayer` cleanup after all async operations finish, enabling a legitimate rejoin on the same server
 
 **Cleanup:** After `disconnectPlayer` completes (whether via normal release or any terminal path), all per-player state tables — including `playerState` itself — are cleared to nil: `playerState`, `loadedData`, `sessionTokens`, `activeLocks`, `lastRefresh`, `inFlightSaves`, `shuttingDown`.
+
+`sessionTokens[userId]` is cleared in step 7 (normal and save-failed paths) or by §6.3 (drain-timeout path). It is **not** cleared in step 2 — doing so early would prevent §6.3's dual identity check from verifying which session's save is completing in the drain-timeout path (see D-20).
 
 **Rejoin safety:** `playerState[userId] = nil` after cleanup is what allows `loadPlayer` to accept a rejoin on the same server (§5.1 rejects any non-nil state). The dual identity check in §7.2–7.3 (not playerState alone) is what blocks stale refresh operations from the old session from interfering with the new one.
 
@@ -326,23 +328,60 @@ for attempt = 1 to SAVE_RETRIES:
         warn("save attempt " .. attempt .. "/" .. SAVE_RETRIES)
         if attempt < SAVE_RETRIES: task.wait(SAVE_BACKOFF * attempt)
 
-inFlightSaves[userId] = math.max(0, (inFlightSaves[userId] or 1) - 1)  -- decrement always
+-- Step 1: Decrement (always — this operation owns this counter slot)
+inFlightSaves[userId] = math.max(0, (inFlightSaves[userId] or 1) - 1)
 
+-- Step 2: Dual identity check (D-20)
+-- sessionTokens[userId] is preserved through disconnectPlayer step 2 (not cleared there),
+-- so this check is valid even in the drain-timeout path (playerState == "abandoned").
+-- If this check fails, a new session T_B is active; this T_A completion must not touch T_B's state.
+if sessionTokens[userId] ~= token:
+    return false   -- stale completion; do not modify playerState, invalidated, or kick
+
+-- Step 3: Session-loss handling — state-conditional
 if confirmedSessionLoss:
-    playerState[userId] = "invalidated"
-    invalidated[userId] = true
-    warn("Session ownership lost for " .. player.Name)
-    player:Kick("Your session was claimed by another server.")
-    return false
+    if playerState[userId] == "active":
+        -- Normal autosave path: genuine ownership loss for the currently active session.
+        playerState[userId] = "invalidated"
+        invalidated[userId] = true
+        warn("savePlayer: session ownership lost for userId=" .. userId)
+        local livePlayer = Players:GetPlayerByUserId(tonumber(userId))
+        if livePlayer then livePlayer:Kick("Your session was claimed by another server.") end
+        return false
+    else:
+        -- State is "disconnecting" or "abandoned": player already leaving / already left.
+        -- The DataStore has another server's token, but there is no active player to kick.
+        -- Skip invalidation; fall through to drain-timeout cleanup below.
+        warn("savePlayer: session ownership lost for userId=" .. userId
+             .. " (state=" .. tostring(playerState[userId]) .. "); no kick needed.")
 
+-- Step 4: Drain-timeout cleanup
+-- After decrement (Step 1), if state is "abandoned" and counter reached 0, the last in-flight
+-- save for this session has completed or failed. Clear session identity and enable rejoin.
+-- This is the ONLY point where sessionTokens is cleared in the drain-timeout path.
+if playerState[userId] == "abandoned" and inFlightSaves[userId] == 0:
+    sessionTokens[userId] = nil      -- clear session identity; kept alive until this point for Step 2
+    playerState[userId] = nil        -- enable same-server rejoin (§5.1 accepts nil state)
+    -- loadedData[userId] was already cleared by disconnectPlayer drain-timeout cleanup (§10.1 step 3)
+    return saveSucceeded
+
+-- Step 5: Normal autosave completion (state == "active" at save time, still active on return)
 if not saveSucceeded:
-    warn("All save retries exhausted for " .. player.Name)
+    warn("savePlayer: all retries exhausted for userId=" .. userId)
 return saveSucceeded
 ```
 
-`confirmedSessionLoss` and `saveSucceeded` are set in the outer loop body, not inside the callback. The in-flight counter is decremented unconditionally so `releaseSession` is never blocked by a save that errored out silently.
+`confirmedSessionLoss` and `saveSucceeded` are set in the outer loop body, not inside the callback. The in-flight counter is decremented unconditionally in Step 1 so `releaseSession` is never blocked by a save that errored out silently.
 
-**Drain-timeout cleanup:** In the drain-timeout TTL path (§10.1 step 3), `disconnectPlayer` exits without clearing `inFlightSaves` because the autosave still owns its slot. After the decrement at the end of `savePlayer`, if `playerState[userId] == "abandoned"` and `inFlightSaves[userId]` reaches 0, `savePlayer` must clear `playerState[userId] = nil`. This releases the userId for a rejoin — it is safe to do so because there are no remaining async operations from the old session.
+**Completion protocol ordering (D-20):**
+
+| Step | Action | Rationale |
+|---|---|---|
+| 1 — Decrement | `inFlightSaves[userId] -= 1` (always) | Releases the counter slot this operation owns; must precede all state checks |
+| 2 — Identity check | `sessionTokens[userId] == token` | Prevents stale T_A completion from modifying T_B state; requires `sessionTokens` preserved through step 2 of disconnectPlayer |
+| 3 — Session-loss | Invalidate only if state == "active" | No kick when player already disconnecting/abandoned |
+| 4 — Drain-timeout cleanup | Clear `sessionTokens`, `playerState` when abandoned + counter == 0 | Only safe after Steps 1–3; `sessionTokens` cleared here (not earlier) |
+| 5 — Normal return | `return saveSucceeded` | Regular autosave completion for active session |
 
 **Token-mismatch non-nil result:** If `UpdateAsync` returns the existing DataStore value (not nil) when our callback returned nil, `result._session.token` will be another server's token. The `ok and` branch (above) catches this: `result ~= nil but token ~= our token` → `confirmedSessionLoss = true`. This is the second path that correctly detects session loss without relying on `result == nil` alone.
 
@@ -376,9 +415,11 @@ T6  UpdateAsync returns (Behaviour A) nil OR (Behaviour B) current record {_sess
     Behaviour A: ok=true, result=nil                           → confirmedSessionLoss=true
     Behaviour B: ok=true, result._session.token==T_B ≠ T_A    → confirmedSessionLoss=true
 
-T7  inFlightSaves[X] decremented to 0
-T8  playerState = "invalidated"; invalidated[X]=true; player kicked; return false
-T9  CORRECT: Server A's snapshot is not written; Server B's session is not disturbed
+T7  inFlightSaves[X] decremented to 0 (Step 1)
+T8  Step 2: sessionTokens[X]==T_A==capturedToken → identity check passes (session still current).
+    Step 3: confirmedSessionLoss=true; playerState[X]=="active" → genuine ownership loss.
+    playerState[X]="invalidated"; invalidated[X]=true; player kicked; return false. ✅
+T9  CORRECT: Server A's snapshot is not written; Server B's session is not disturbed.
 
 ALSO CORRECT: snapshot was captured before the UpdateAsync call.
 Even if loadedData[X] is cleared at T1 by a concurrent releaseSession, the
@@ -622,7 +663,7 @@ In the **abandoned path** (drain timeout), `releaseSession` is never called. Ano
 `releaseSession` is called only when:
 - `playerState[userId] == "disconnecting"` (set by `disconnectPlayer`)
 - `inFlightSaves[userId] == 0` (confirmed by drain AND by `disconnectSave` returning `true` — `disconnectSave` is synchronous and decrements the counter before returning)
-- `sessionTokens[userId]` has been cleared (set to nil by `disconnectPlayer` to block autosaves before the drain wait)
+- `sessionTokens[userId]` still holds T_A's token at this point (not cleared in step 2 — see D-20 fix); it will be cleared in step 7 cleanup
 - `disconnectSave(userId, player, token, snapshot)` returned `true` (save committed)
 
 ### 8.2 Token capture and callback
@@ -761,11 +802,13 @@ function disconnectPlayer(userId, player):
     shuttingDown[userId] = true
     playerState[userId] = "disconnecting"
     
-    -- 2. Stop refresh and block new autosaves
+    -- 2. Stop refresh; capture token for disconnect save and release (D-20 fix)
     activeLocks[userId] = nil                        -- refresh loop stops iterating this player
-    local token = sessionTokens[userId]              -- capture before clearing
-    sessionTokens[userId] = nil                      -- §6.1 state guard already blocks autosaves;
-                                                     -- token nil is defence-in-depth
+    local token = sessionTokens[userId]              -- capture for disconnectSave and releaseSession
+    -- sessionTokens[userId] is NOT cleared here. Autosaves are already blocked by the state
+    -- guard ("disconnecting"). Preserving sessionTokens allows §6.3's Step-2 dual identity check
+    -- to remain valid if drain times out and the autosave completes after disconnectPlayer exits.
+    -- sessionTokens is cleared in step 7 (normal / save-failed) or by §6.3 (drain-timeout).
     
     -- 3. Drain in-flight autosaves
     --    Any autosave that captured its token before step 2 may still be in flight.
@@ -788,10 +831,14 @@ function disconnectPlayer(userId, player):
         loadedData[userId]    = nil
         invalidated[userId]   = nil
         lastRefresh[userId]   = nil
+        -- sessionTokens[userId] is left intact intentionally (D-20 fix).
+        -- §6.3 Step 2 requires sessionTokens to be non-nil to verify that this autosave's
+        -- completion belongs to the T_A session (not a newer T_B). §6.3 Step 4 clears it.
+        --
         -- playerState[userId] is left as "abandoned" (non-nil) intentionally.
-        -- Meaning: the disconnect lifecycle has exited, but an autosave is still in flight.
-        -- loadPlayer §5.1 rejects non-nil state → no rejoin until autosave completes.
-        -- After the autosave decrements inFlightSaves to 0, §6.3 clears playerState to nil.
+        -- §5.1 rejects non-nil state → no rejoin until autosave completes and §6.3 clears it.
+        -- After the decrement, §6.3 Step 4 clears playerState[userId] = nil when
+        -- inFlightSaves[userId] == 0 and state is "abandoned".
         
         shuttingDown[userId]  = nil
         -- Clearing shuttingDown signals "lifecycle owner has exited" to any observing caller.
@@ -807,7 +854,7 @@ function disconnectPlayer(userId, player):
     
     -- 5. Disconnect save (via disconnectSave — the only save permitted in "disconnecting" state)
     --    disconnectSave is synchronous: when it returns, inFlightSaves[userId] is 0.
-    --    It uses the explicitly captured token and snapshot — not sessionTokens (cleared)
+    --    It uses the explicitly captured token and snapshot — not sessionTokens
     --    or loadedData (safe to clear after this call).
     local saveOk = disconnectSave(userId, player, token, snapshot)
     
@@ -822,6 +869,7 @@ function disconnectPlayer(userId, player):
         invalidated[userId]   = nil
         lastRefresh[userId]   = nil
         inFlightSaves[userId] = nil   -- disconnectSave already decremented to 0
+        sessionTokens[userId] = nil
         shuttingDown[userId]  = nil
         playerState[userId]   = nil   -- clear terminal state; enables rejoin on same server
         return
@@ -834,6 +882,7 @@ function disconnectPlayer(userId, player):
     invalidated[userId]   = nil
     lastRefresh[userId]   = nil
     inFlightSaves[userId] = nil
+    sessionTokens[userId] = nil      -- cleared here; was preserved through step 2 for §6.3 identity check
     shuttingDown[userId]  = nil
     playerState[userId]   = nil   -- clear "released" or "abandoned"; enables rejoin on same server
     -- Clearing playerState to nil is safe here: all async operations (drain, disconnectSave,
@@ -924,22 +973,24 @@ end)
 
 ```
 T0  PlayerRemoving calls disconnectPlayer(X).
-    shuttingDown[X]=true; state→"disconnecting"; activeLocks[X]=nil; token=T_A; sessionTokens[X]=nil.
+    shuttingDown[X]=true; state→"disconnecting"; activeLocks[X]=nil; token=T_A.
+    (sessionTokens[X] NOT cleared here — preserved for §6.3 identity check.)
 T1  Drain: inFlightSaves[X]==0 → pass immediately.
 T2  snapshot=deepCopy(loadedData[X]) taken.
     disconnectSave(X, player, T_A, snapshot): inFlightSaves[X]=1; UpdateAsync yields.
 T3  disconnectSave UpdateAsync completes:
     result._session.token==T_A → ✅; inFlightSaves[X]=0; return true.
 T4  releaseSession(X, T_A): token match → released=true → state→"released" ✅
-T5  Cleanup: loadedData[X]=nil; inFlightSaves[X]=nil; shuttingDown[X]=nil.
+T5  Step-7 Cleanup: loadedData[X]=nil; inFlightSaves[X]=nil; sessionTokens[X]=nil; shuttingDown[X]=nil.
 ```
 
 **Timeline B: Autosave in flight when PlayerRemoving fires**
 
 ```
-T0  Autosave: savePlayer(X); snapshot_T0 captured; inFlightSaves[X]=1; UpdateAsync yields.
+T0  Autosave: savePlayer(X); token=T_A captured; snapshot_T0 captured; inFlightSaves[X]=1; UpdateAsync yields.
 T1  PlayerRemoving: disconnectPlayer(X).
-    shuttingDown[X]=true; state→"disconnecting"; token=T_A; sessionTokens[X]=nil.
+    shuttingDown[X]=true; state→"disconnecting"; activeLocks[X]=nil; token=T_A.
+    (sessionTokens[X] NOT cleared.)
 T2  Drain: inFlightSaves[X]==1 > 0 → wait(0.05) loop.
 T3  Autosave UpdateAsync completes; inFlightSaves[X]=0 → drain passes.
     (DataStore now has the autosave snapshot_T0.)
@@ -949,7 +1000,7 @@ T5  disconnectSave UpdateAsync completes:
     result._session.token==T_A → ✅; inFlightSaves[X]=0.
     DataStore: {snapshot_T1, _session:{T_A}} (snapshot_T1 ≥ snapshot_T0 by time ordering).
 T6  releaseSession(X, T_A): released=true; state→"released" ✅.
-T7  Cleanup.
+T7  Step-7 Cleanup: loadedData[X]=nil; inFlightSaves[X]=nil; sessionTokens[X]=nil; shuttingDown[X]=nil.
 ```
 
 No two saves are in flight simultaneously. The disconnect save always starts after any prior autosave completes. snapshot_T1 captures all data written between T0 (autosave capture) and T4 (disconnect capture). The final DataStore state is snapshot_T1, which is the most recent snapshot. ✅
@@ -962,7 +1013,7 @@ T1  BindToClose iterates Players. Player X is in the list.
     task.spawn → disconnectPlayer(X) → shuttingDown[X]==true →
     Phase 1: while shuttingDown[X] do task.wait(0.05) end → loops.
 T2  PlayerRemoving lifecycle completes normally (drain+save+release).
-    Step 7 cleanup: inFlightSaves[X]=nil; shuttingDown[X]=nil; playerState[X]=nil.
+    Step 7 cleanup: inFlightSaves[X]=nil; sessionTokens[X]=nil; shuttingDown[X]=nil; playerState[X]=nil.
 T3  Phase 1 exits (shuttingDown nil). Phase 2: (inFlightSaves[X] or 0) = (nil or 0) = 0 → pass immediately.
 T4  Observer returns → disconnectCount -= 1 ✅
 Expected: Counter decremented only after all operations complete. Normal path: no Phase-2 wait. PASS
@@ -974,7 +1025,7 @@ Expected: Counter decremented only after all operations complete. Normal path: n
 T0  BindToClose: task.spawn → disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle starts.
 T1  PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]==true →
     Phase 1: while shuttingDown[X] do task.wait(0.05) end → loops.
-T2  BindToClose lifecycle completes normally. Cleanup: shuttingDown[X]=nil; inFlightSaves[X]=nil.
+T2  BindToClose lifecycle completes normally. Cleanup: inFlightSaves[X]=nil; sessionTokens[X]=nil; shuttingDown[X]=nil.
 T3  Phase 1 exits. Phase 2: (nil or 0) = 0 → pass immediately.
 T4  PlayerRemoving observer returns. ✅
 Expected: Exactly one save, one release. PlayerRemoving observer does no saves. PASS
@@ -983,34 +1034,39 @@ Expected: Exactly one save, one release. PlayerRemoving observer does no saves. 
 **Timeline E: Autosave drain timeout — TTL path; autosave completes after disconnect exits**
 
 ```
-T0  Autosave: savePlayer(X); inFlightSaves[X]=1; UpdateAsync stalled (DataStore unavailable).
-T1  PlayerRemoving: disconnectPlayer(X). state→"disconnecting"; sessionTokens[X]=nil.
+T0  Autosave: savePlayer(X); capturedToken=T_A; inFlightSaves[X]=1; UpdateAsync stalled.
+T1  PlayerRemoving: disconnectPlayer(X). state→"disconnecting"; activeLocks[X]=nil.
+    (sessionTokens[X] NOT cleared — preserved for §6.3 Step-2 identity check.)
 T2  Drain: inFlightSaves[X]==1 > 0; wait loop.
 T3  After DRAIN_DEADLINE (5s): inFlightSaves[X] still 1 → drain timeout.
     state→"abandoned"; loadedData[X]=nil; shuttingDown[X]=nil.
-    (inFlightSaves[X] NOT cleared; autosave owns its slot.)
-T4  Autosave eventually completes (DataStore recovers): inFlightSaves[X] decremented → 0.
-    Callback: current._session.token==T_A → data written (see §6.2). ✅
-    §6.3 drain-timeout cleanup: playerState[X]=="abandoned" AND inFlightSaves[X]==0
-    → playerState[X]=nil. userId is now eligible for rejoin.
-T5  LOCK_TTL expires (60s from last DataStore write; may be later than T3 if a refresh
-    completed after T1 — see §7.5). Session available to other servers. ✅
+    sessionTokens[X] still T_A; inFlightSaves[X] NOT cleared.
+T4  Autosave eventually completes (DataStore recovers).
+    §6.3 Step 1: inFlightSaves[X] decremented → 0.
+    §6.3 Step 2: sessionTokens[X]==T_A==capturedToken → identity check passes. ✅
+    §6.3 Step 3: confirmedSessionLoss=false (token matched in DataStore) → skip.
+    §6.3 Step 4: playerState[X]=="abandoned" AND inFlightSaves[X]==0
+    → sessionTokens[X]=nil; playerState[X]=nil. userId now eligible for rejoin.
+T5  LOCK_TTL expires (60s from last DataStore write; may be later if a refresh completed
+    after T1 — see §7.5). Session available to other servers. ✅
 Data integrity: autosave snapshot written (T4); playerState cleared (T4). PASS
 ```
 
 **Timeline G: PlayerRemoving owns; drain times out; BindToClose observes; must not report false completion (NEW — Revision 9, D-17)**
 
 ```
-T0  Autosave: savePlayer(X); inFlightSaves[X]=1; UpdateAsync stalled.
+T0  Autosave: savePlayer(X); capturedToken=T_A; inFlightSaves[X]=1; UpdateAsync stalled.
 T1  PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]=true; drain wait starts.
+    (sessionTokens[X] NOT cleared.)
 T2  BindToClose fires. task.spawn → disconnectPlayer(X) → shuttingDown[X]==true →
     Phase 1: while shuttingDown[X] do task.wait(0.05) end → loops.
 T3  DRAIN_DEADLINE (5s) exceeded. Owner: state→"abandoned"; shuttingDown[X]=nil; return.
-    inFlightSaves[X] still 1.
+    inFlightSaves[X] still 1; sessionTokens[X] still T_A.
 T4  Phase 1 exits (shuttingDown nil).
     Phase 2: (inFlightSaves[X] or 0) = 1 > 0 → while loop starts.
     disconnectCount NOT decremented. BindToClose outer loop still running. ✅
-T5  Autosave UpdateAsync completes: inFlightSaves[X] decremented → 0; playerState[X]=nil.
+T5  Autosave UpdateAsync completes. §6.3: inFlightSaves[X]→0; identity check passes;
+    state=="abandoned" AND counter==0 → sessionTokens[X]=nil; playerState[X]=nil.
 T6  Phase 2 exits. Observer returns → disconnectCount -= 1 ✅
 Expected: disconnectCount reflects actual save completion, not lifecycle exit. PASS
 
@@ -1022,14 +1078,16 @@ Broken (Revision 8) behaviour:
 **Timeline H: BindToClose owns; drain times out; PlayerRemoving observes; same two-phase wait (NEW — Revision 9, D-17)**
 
 ```
-T0  Autosave: savePlayer(X); inFlightSaves[X]=1; UpdateAsync stalled.
+T0  Autosave: savePlayer(X); capturedToken=T_A; inFlightSaves[X]=1; UpdateAsync stalled.
 T1  BindToClose fires first: task.spawn → disconnectPlayer(X) → shuttingDown[X]=true; drain starts.
+    (sessionTokens[X] NOT cleared.)
 T2  PlayerRemoving fires: disconnectPlayer(X) → shuttingDown[X]==true →
     Phase 1: while shuttingDown[X] do task.wait(0.05) end → loops.
 T3  DRAIN_DEADLINE exceeded. Owner (BindToClose): state→"abandoned"; shuttingDown[X]=nil; return.
-    inFlightSaves[X] still 1.
+    inFlightSaves[X] still 1; sessionTokens[X] still T_A.
 T4  Phase 1 exits. Phase 2: inFlightSaves[X]=1 → Phase-2 wait loop.
-T5  Autosave completes: inFlightSaves[X]=0; playerState[X]=nil.
+T5  Autosave completes. §6.3: inFlightSaves[X]=0; identity passes; state=="abandoned"
+    → sessionTokens[X]=nil; playerState[X]=nil.
 T6  Phase 2 exits. PlayerRemoving observer returns. ✅
 Expected: Same protocol regardless of which caller owns. PASS
 ```
@@ -1039,10 +1097,11 @@ Expected: Same protocol regardless of which caller owns. PASS
 ```
 T0  refreshSession for X (token T_A captured): UpdateAsync in progress.
 T1  PlayerRemoving: disconnectPlayer(X).
-    state→"disconnecting"; sessionTokens[X]=nil; activeLocks[X]=nil.
+    state→"disconnecting"; activeLocks[X]=nil.
+    (sessionTokens[X] NOT cleared in step 2.)
 T2  disconnectPlayer normal path: drain→disconnectSave→releaseSession.
-    state→"released"; cleanup:
-    loadedData[X]=nil; lastRefresh[X]=nil; shuttingDown[X]=nil;
+    state→"released"; step-7 cleanup:
+    loadedData[X]=nil; lastRefresh[X]=nil; sessionTokens[X]=nil; shuttingDown[X]=nil;
     playerState[X]=nil.   ← enables rejoin
 T3  Player rejoins same server. loadPlayer(X): playerState[X]==nil → allowed.
     New token T_B generated; state→"loading"→"active"; sessionTokens[X]=T_B.
@@ -1063,14 +1122,16 @@ Expected: Old T_A refresh cannot invalidate, kick, or update state for T_B sessi
 **Timeline I: Drain-timeout autosave completes; playerState cleared; same-server rejoin enabled (NEW — Revision 9, D-17)**
 
 ```
-T0  Autosave: savePlayer(X); inFlightSaves[X]=1; UpdateAsync stalled.
+T0  Autosave: savePlayer(X); capturedToken=T_A; inFlightSaves[X]=1; UpdateAsync stalled.
 T1  PlayerRemoving: disconnectPlayer(X) → drain timeout → state="abandoned"; shuttingDown[X]=nil.
-    inFlightSaves[X] still 1; playerState[X]="abandoned".
+    inFlightSaves[X] still 1; playerState[X]="abandoned"; sessionTokens[X]=T_A (preserved).
 T2  BindToClose observer (Phase 2 wait) loops on inFlightSaves[X] > 0.
 T3  DataStore recovers. Autosave UpdateAsync completes.
-    §6.3: inFlightSaves[X] decremented → 0.
-          playerState[X]=="abandoned" AND inFlightSaves[X]==0
-          → playerState[X]=nil. ✅ userId now available for rejoin.
+    §6.3 Step 1: inFlightSaves[X] decremented → 0.
+    §6.3 Step 2: sessionTokens[X]==T_A==capturedToken → identity passes.
+    §6.3 Step 3: confirmedSessionLoss=false → skip.
+    §6.3 Step 4: playerState[X]=="abandoned" AND inFlightSaves==0
+    → sessionTokens[X]=nil; playerState[X]=nil. ✅ userId now available for rejoin.
 T4  BindToClose Phase-2 wait: (inFlightSaves[X] or 0) = (nil or 0) = 0 → exits.
     disconnectCount -= 1 ✅
 T5  Player rejoins: loadPlayer(X): playerState[X]==nil → allowed. New session T_B starts.
@@ -1097,6 +1158,50 @@ T5  Spawned observers for X and Y are still running (Phase-2 wait).
 Expected: Warning logged; server shuts down within deadline; loss documented. PASS (degraded path)
 ```
 
+**Timeline K: T_A autosave detects session loss after drain timeout; T_B not invalidated or kicked (NEW — Revision 10, D-20)**
+
+```
+T0  Autosave: savePlayer(X); capturedToken=T_A; inFlightSaves[X]=1; UpdateAsync stalled.
+T1  PlayerRemoving: disconnectPlayer(X) → drain timeout → state="abandoned"; shuttingDown[X]=nil.
+    inFlightSaves[X] still 1; sessionTokens[X]=T_A (preserved — D-20 fix).
+T2  Another server S_B acquires X's session in DataStore (T_B_server token; T_A TTL expired).
+T3  T_A autosave UpdateAsync completes.
+    Callback: current._session.token==T_B_server ≠ T_A → callback returns nil.
+    Result: confirmedSessionLoss=true.
+    §6.3 Step 1: inFlightSaves[X] decremented → 0.
+    §6.3 Step 2: sessionTokens[X]==T_A==capturedToken → identity check passes. ✅
+    §6.3 Step 3: confirmedSessionLoss=true; playerState[X]=="abandoned" (NOT "active")
+    → skip invalidation; warn "session ownership lost (state=abandoned); no kick needed."
+    §6.3 Step 4: playerState[X]=="abandoned" AND inFlightSaves==0
+    → sessionTokens[X]=nil; playerState[X]=nil. ✅
+T4  Same-server player rejoins: playerState[X]==nil → loadPlayer allowed.
+    T_B_server session in DataStore: acquisition checks TTL/released → may succeed or fail
+    depending on T_B_server session status. No permanent block.
+Expected: T_A confirmedSessionLoss in abandoned path → warn log; no invalidation; no kick; rejoin enabled. PASS
+
+Broken (Revision 9) behaviour:
+    T3: §6.3 no identity check: confirmedSessionLoss fires immediately.
+    playerState[X]="invalidated" ← BUG (was "abandoned"; now "invalidated").
+    §6.3 drain-timeout cleanup: playerState != "abandoned" → skip nil-clear.
+    playerState[X] stays "invalidated" forever → same-server rejoin permanently blocked. ← D-20
+```
+
+**Timeline L: T_A autosave completes after T_B is fully active on same server; T_B identity check blocks T_A (NEW — Revision 10, D-20)**
+
+```
+Precondition: T_A session released normally; playerState[X]=nil; T_B loaded; state="active";
+sessionTokens[X]=T_B; T_A autosave was in flight during T_A's normal lifecycle (edge: very late save).
+T0  T_A autosave §6.3 completion fires.
+T1  §6.3 Step 1: inFlightSaves[X] decremented → 0 (releases T_A's slot).
+T2  §6.3 Step 2: sessionTokens[X]==T_B ≠ capturedToken(T_A) → stale completion → return false. ✅
+    T_B's playerState, inFlightSaves, invalidated, and sessionTokens are all untouched.
+Expected: Stale T_A save completion cannot modify T_B session state. PASS
+Note: This case requires T_B to have loaded before §6.3 fires; possible if T_A released normally
+      (not drain-timeout) and an in-flight save completed very late. The two-phase wait and §5.1 guard
+      prevent T_B from loading while T_A's save is still in the counter — this scenario is primarily
+      a defence-in-depth validation.
+```
+
 ---
 
 ## 11. Retry and Recovery Summary
@@ -1104,7 +1209,7 @@ Expected: Warning logged; server shuts down within deadline; loss documented. PA
 | Operation | DataStore error | Confirmed session loss | Success |
 |---|---|---|---|
 | `loadPlayer` | Retry 3×, 2s/4s backoff; kick after all fail | Kick immediately; no retry | Build data from returned record |
-| `savePlayer` | Retry 3×, 2s/4s backoff | `invalidated[userId]=true`; kick; no retry | Return true |
+| `savePlayer` | Retry 3×, 2s/4s backoff | If state=="active": `invalidated[userId]=true`; kick; no retry. If state=="abandoned": log warning; drain-timeout cleanup clears state. | Return true |
 | `refreshSession` | Log; check elapsed vs LOCK_TTL | `invalidated[userId]=true`; kick (dual identity check: only if still active AND token matches) | Update `lastRefresh` (dual identity check applies) |
 | `disconnectPlayer` / `disconnectSave` | TTL path if drain deadline exceeded; "abandoned" if disconnectSave fails or all retries exhausted | disconnectSave detects session loss → state → "abandoned"; skips releaseSession | State → "released" |
 | `releaseSession` | Retry 3×; state → "abandoned" on all DataStore errors exhausted | Token mismatch → state → "released" (session superseded) | State → "released" |
