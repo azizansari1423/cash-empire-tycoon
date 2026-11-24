@@ -3,7 +3,7 @@
 **Date:** 2026-11-24
 **Branch:** `feature/phase-1-data-foundation` (commit b05aa20)
 **Review branch:** `claude-review/phase-1`
-**Status:** Architecture revised — pending approval before implementation
+**Status:** Revision 4 — pending approval before implementation
 
 ---
 
@@ -123,6 +123,64 @@ There is no formal state machine governing player data lifecycle. This creates s
 | R10 | `_session` metadata is never present in `loadedData[userId]` or in the value returned by `getData`. It is stripped at load time and reconstructed from `current._session` inside the save callback. | Existing requirement | §2, §5.6, §6.2 |
 | R11 | Legacy records without `_session` are treated as available for acquisition. All existing game fields are preserved. `_session` is added to the record on first load without overwriting any other field. | Existing requirement | §12 |
 | R12 | A new player (no prior DataStore record) is initialized from `DEFAULT_DATA`. An existing player whose load fails (all retries exhausted, or confirmed session loss at load time) is kicked without being initialized as a new player. `loadedData[userId]` is never populated on failure. | Existing requirement | §5.5 |
+| R13 | `savePlayer` deep-copies `loadedData[userId]` into a local `snapshot` before the `UpdateAsync` call. The callback uses only `snapshot` and the captured `token` — both are immutable from that point forward. The callback does not read `loadedData`, `sessionTokens`, or any other shared mutable table. | D-6 | §6.1, §6.2 |
+| R14 | The acquisition callback uses a single TTL-based availability rule: a session is available if absent, released, or `(now - sess.since) >= LOCK_TTL`. A live session is blocked if and only if `sess.token ~= token`. The job ID is not independently evaluated for blocking. | D-7 | §5.3 |
+| R15 | `refreshSession` treats any non-error `UpdateAsync` result where `result._session.token ~= sessionTokens[userId]` as confirmed ownership loss, including both `result == nil` and a non-nil result with a different token. Only `result._session.token == sessionTokens[userId]` constitutes a confirmed refresh. | D-8 | §7.2 |
+| R16 | `inFlightSaves[userId]` tracks the count of active `savePlayer` UpdateAsync calls. It is incremented before each UpdateAsync and decremented unconditionally after. `releaseSession` waits for `inFlightSaves[userId] == 0` (up to 5 seconds) before proceeding to its release UpdateAsync. | D-9 | §8.1 |
+
+---
+
+## Defects Found in Revision 3 Architecture (7aa733d)
+
+### D-6: Save callback reads `loadedData[userId]` during UpdateAsync retry (CRITICAL)
+
+**File:** `PlayerDataManager.lua` (design)
+
+The revision 3 save callback reads `loadedData[userId]` inside the UpdateAsync callback:
+
+```lua
+newRecord = deepCopy(loadedData[userId])
+```
+
+The UpdateAsync callback can be retried by Roblox. If `releaseSession` runs while the callback is mid-execution and clears `loadedData[userId]`, the retry sees `loadedData[userId] == nil` and either errors or writes a nil record.
+
+**Fix:** Deep-copy `loadedData[userId]` into a local `snapshot` variable **before** the UpdateAsync call. The callback uses only `snapshot` and `token` — both immutable after capture. See architecture §6.1–6.2 (Revision 4).
+
+---
+
+### D-7: Acquisition callback has contradictory same-jobId handling (HIGH)
+
+**File:** `PlayerDataManager.lua` (design)
+
+Revision 3 §5.3 had two independent guards — an `anotherServer` check and a `same-server different-token` check — that could produce contradictory results. Specifically:
+- §5.3 unconditionally rejected `sess.jobId == JOB_ID, sess.token ~= token`
+- Test scenario DS-3 expected an expired same-jobId session to be acquirable
+
+An expired session that happens to share the same job ID (normal in Studio) would be rejected by the same-server guard even though the TTL had expired.
+
+**Fix:** Replace the two independent guards with a single TTL-based rule. A session is available if it is absent, explicitly released, or has `(now - sess.since) >= LOCK_TTL`. A live session (`TTL not expired`) is blocked if and only if `sess.token ~= token`. The job ID is not evaluated separately. See architecture §5.3 (Revision 4).
+
+---
+
+### D-8: `refreshSession` did not handle non-nil wrong-token result (HIGH)
+
+**File:** `PlayerDataManager.lua` (design)
+
+Revision 3 §7.2 handled `result == nil` as ownership loss but did not handle the case where `UpdateAsync` returns the existing DataStore record (another server's token) rather than nil when the callback returns nil. In that case, `result._session.token ~= sessionTokens[userId]` but the code did not reach the ownership-loss branch.
+
+**Fix:** Treat any `ok==true` result where `result._session.token ~= sessionTokens[userId]` as ownership loss. Both `result==nil` and wrong-token non-nil now share the same `else` path. See architecture §7.2 (Revision 4).
+
+---
+
+### D-9: No mechanism to wait for in-flight saves before releasing (HIGH)
+
+**File:** `PlayerDataManager.lua` (design)
+
+Revision 3 `releaseSession` cleared `sessionTokens` to block new saves, but did not wait for saves already in-flight. If the release UpdateAsync was serialized by DataStore before an in-flight save's UpdateAsync, the release would mark the session as released, and then the in-flight save's callback would see `current._session.released == false` (the pre-release state cached by Roblox) and re-write the data record, temporarily removing the `released=true` flag.
+
+Additionally, two concurrent saves with different snapshots (autosave + PlayerRemoving save) can produce a last-DataStore-write-wins race where the older snapshot overwrites the newer one.
+
+**Fix:** Add `inFlightSaves[userId]` counter. `savePlayer` increments it before UpdateAsync and decrements it after. `releaseSession` waits for `inFlightSaves[userId] == 0` (5-second deadline) before proceeding to its own UpdateAsync. This guarantees the final save is committed before the release. See architecture §8.1 (Revision 4).
 
 ---
 
@@ -134,3 +192,12 @@ There is no formal state machine governing player data lifecycle. This creates s
 | Issue 2 — same-server idempotency | `current._session.jobId == JOB_ID` allowed re-acquisition regardless of token | Idempotent retry only when `current._session.token == token`. Different token + same jobId → abort |
 | Issue 3 — mutation after ownership loss | `loadFailed` did not block `getData`; `addCash`/`spendCash` could mutate stale data | `invalidated[userId]` checked in `getData`; covers load failure AND mid-game session loss |
 | Issue 4 — save/release coordination | No formal lifecycle; `sessionTokens` clear did not prevent concurrent release calls | `playerState[userId]` state machine; "releasing" state blocks duplicate releases; in-flight saves use captured token |
+
+## Summary of Changes from Revision 3 (7aa733d)
+
+| Issue | Revision 3 problem | Revision 4 fix |
+|---|---|---|
+| D-6 — save callback reads shared state | Callback read `loadedData[userId]` during UpdateAsync; could see nil on retry after releaseSession clears it | `snapshot = deepCopy(loadedData[userId])` captured before UpdateAsync; callback uses only snapshot + token |
+| D-7 — acquisition contradiction | Same-jobId rejection was unconditional; contradicted test DS-3 for expired sessions | Single TTL rule: session available if expired or released; live sessions blocked only by token mismatch |
+| D-8 — refresh non-nil wrong-token | Only checked `result == nil` for ownership loss; missed non-nil result with wrong token | All `ok==true` outcomes where `result._session.token ~= sessionTokens[userId]` treated as ownership loss |
+| D-9 — no in-flight save wait | `releaseSession` did not wait for in-flight saves; release could be serialized before save in DataStore | `inFlightSaves[userId]` counter; `releaseSession` waits for counter to reach 0 before releasing |

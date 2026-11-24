@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-24
 **Commit under review:** b05aa20 (`feature/phase-1-data-foundation`)
-**Review revision:** 3 (architecture.md, implementation-report.md, test-results.md at this commit)
+**Review revision:** 4
 **Status:** Test plan revised — runtime tests not yet executed
 
 > **Note:** All test results in this document are design-level analysis. No runtime tests have been executed. Test scenarios marked PASS/FAIL reflect whether the revised design is expected to handle them correctly, not observed runtime behaviour.
@@ -85,35 +85,33 @@ Step 3:   Thread 2 returns nil — no session acquired, no data loaded, no token
 Expected: Exactly one session acquired. Thread 2 is a safe no-op. DESIGN: PASS
 ```
 
-**Scenario DS-2: Same-server acquisition with different token (stale entry from prior crash)**
+**Scenario DS-2: Live same-server session with different token is blocked**
 
 ```
-Setup:    Server crashed and restarted (same game.JobId in Studio; different jobId in prod).
-          DataStore has {_session: {jobId: JOB_ID, token: T_OLD}} from crashed session.
-          New loadPlayer: token T_NEW generated.
-Step 1:   Callback: current._session.jobId == JOB_ID, current._session.token == T_OLD ≠ T_NEW.
-Step 2:   ourRetry = (T_OLD == T_NEW) = false.
-Step 3:   anotherServer = (T_OLD.jobId ≠ JOB_ID) = false (same server).
-Step 4:   Same-server different-token branch: return nil.
-Step 5:   UpdateAsync returns nil; outer code: confirmed failure → kick "active on another server".
-Note:     In production, job IDs differ between instances, so T_OLD session appears as
-          "another server." Same-job-ID case only occurs in Studio. Studio has LOCK_TTL=60s;
-          if the old session's `since` is > 60s ago, TTL check passes and acquisition proceeds.
-Expected: Either kicked (session live, TTL not expired) or acquired (session expired). DESIGN: PASS
+Setup:    DataStore has {_session: {jobId: JOB_ID, token: T_OLD, since: 10s ago}}.
+          LOCK_TTL = 60s. New loadPlayer: token T_NEW generated.
+Step 1:   Callback: sess.since = 10s ago; (now - sess.since) = 10 < 60 → session live.
+Step 2:   sess.token == T_OLD ≠ T_NEW → live session, token mismatch → return nil.
+Step 3:   UpdateAsync returns nil (or existing record with T_OLD).
+          ok=true, (result==nil OR result._session.token==T_OLD≠T_NEW) → confirmed failure → kick.
+Expected: Player kicked. DESIGN: PASS
+Note:     This is the same-server guard from §5.1 (concurrent load) acting as defence-in-depth.
+          Under normal operation the concurrent-load guard would prevent two loadPlayer calls
+          from reaching the callback simultaneously. This covers Studio restarts within LOCK_TTL.
 ```
 
-**Scenario DS-3: Same-server different-token — TTL expired**
+**Scenario DS-3: Expired same-server session (any jobId) is available for acquisition**
 
 ```
 Setup:    DataStore has {_session: {jobId: JOB_ID, token: T_OLD, since: 100s ago}}.
           LOCK_TTL = 60s. New loadPlayer: token T_NEW.
-Step 1:   Callback: sess.jobId == JOB_ID, sess.token ≠ T_NEW.
-          anotherServer check: sess.jobId == JOB_ID → anotherServer = false.
-          TTL check: (now - sess.since) = 100 > 60 → session expired.
-Step 2:   Expired session: treat as available → write new session with T_NEW.
+Step 1:   Callback: (now - sess.since) = 100 >= 60 → session expired → available.
+          (jobId check is NOT performed; TTL is the only gate.)
+Step 2:   Fall through to write: newRecord._session = {T_NEW, now, released:false}.
+Step 3:   UpdateAsync returns newRecord; result._session.token == T_NEW → acquisition confirmed.
 Expected: Session acquired normally. DESIGN: PASS
-Note:     The same-server-different-token branch only blocks when TTL is live. Expired sessions
-          fall through to the standard "available" path.
+Note:     Consistent with §5.3 Revision 4. The same-server guard in DS-2 applies only when
+          TTL is live. An expired session is reclaimed regardless of jobId.
 ```
 
 ---
@@ -154,19 +152,132 @@ Expected: getData returns valid data during graceful release path. DESIGN: PASS
 
 ---
 
-### Save/Release Concurrency (NEW — Issue 4)
+### Save Snapshot Correctness (NEW — Revision 4, D-6)
 
-**Scenario SR-1: Autosave in-flight when PlayerRemoving fires**
+**Scenario SS-1: releaseSession clears loadedData while save callback is mid-retry**
 
 ```
-Setup:    Autosave thread for X: state=="active" ✓; token=T_A captured; UpdateAsync yields.
+Setup:    Server A: savePlayer starts for Player X.
+          token=T_A, snapshot=deepCopy(loadedData[X]) captured before UpdateAsync.
+          loadedData[X] = {Cash:500}.
+Step 1:   savePlayer UpdateAsync yields (callback in progress).
+Step 2:   releaseSession runs: loadedData[X] = nil (cleared in PlayerRemoving cleanup).
+Step 3:   Roblox retries save callback (ack lost on first attempt).
+          Callback reads: snapshot (local variable, deepCopy) → {Cash:500} ✓
+                          token (local variable) → T_A ✓
+          Neither reads loadedData[X] (which is now nil).
+Step 4:   current._session.token == T_A → callback writes {Cash:500, _session:{T_A}}.
+Step 5:   result._session.token == T_A → save confirmed ✅
+Expected: Correct data written even after loadedData cleared. DESIGN: PASS
+
+Broken (Revision 3) behaviour at Step 3:
+          Callback reads: loadedData[X] → nil → deepCopy(nil) → error or empty record ← WRONG
+```
+
+**Scenario SS-2: Two overlapping saves with different snapshots — ordering**
+
+```
+Setup:    Autosave (time T0) captures snapshot_T0 = {Cash:100}.
+          addCash(50) runs: loadedData[X].Cash = 150.
+          PlayerRemoving save (time T1) captures snapshot_T1 = {Cash:150}.
+          Both UpdateAsync calls are in-flight.
+Step 1:   releaseSession waits for inFlightSaves[X] == 2 → loops.
+Step 2:   DataStore serializes: autosave (snapshot_T0) commits first.
+          DataStore now has {Cash:100, _session:{T_A}}.
+Step 3:   PlayerRemoving save (snapshot_T1) callback: T_A matches → writes {Cash:150, _session:{T_A}}.
+          inFlightSaves[X] = 0 → releaseSession wait exits.
+Step 4:   release UpdateAsync commits → {Cash:150, _session:{T_A, released:true}}.
+Final DataStore state: {Cash:150, ...} ✅ (most recent snapshot committed last)
+Note:     This ordering holds because releaseSession waited for both saves.
+          If DataStore had serialized PlayerRemoving save first (Step 2 reversed),
+          the autosave would commit {Cash:100} last — data 50 coins stale.
+          This is Risk 6 in §15 of architecture.md.
+Expected: At worst one autosave interval of staleness (60s earnings).
+          Release always comes after both saves. DESIGN: PASS (with Risk 6 noted)
+```
+
+### Refresh Non-Nil Wrong-Token Result (NEW — Revision 4, D-8)
+
+**Scenario RV-1: refreshSession — UpdateAsync returns existing record with wrong token**
+
+```
+Setup:    Server A holds session, token T_A. Server B acquires session (T_B in DataStore).
+          Server A refresh callback: current._session.token == T_B ≠ T_A → callback returns nil.
+Step 1:   UpdateAsync returns (Behaviour B) current record {_session:{T_B, ...}}.
+          ok=true, result != nil, result._session.token == T_B ≠ T_A.
+Step 2:   Revision 3 code: only checked `if ok and result == nil` → did NOT reach ownership-loss path.
+          Server A believed refresh succeeded ← WRONG (Revision 3 defect).
+Step 3:   Revision 4 code: else branch catches `result._session.token ~= T_A` → ownership loss path.
+          invalidated[X]=true; player kicked. ✅
+Expected: Revision 4 correctly handles both Behaviour A (nil) and Behaviour B (wrong-token non-nil).
+DESIGN: PASS (Revision 4)
+```
+
+**Scenario RV-2: refreshSession — UpdateAsync returns nil (Behaviour A)**
+
+```
+Step 1:   Server B acquires; Server A refresh callback returns nil.
+          UpdateAsync returns nil.
+Step 2:   ok=true, result==nil → else branch → ownership loss → invalidated; kick ✅
+Expected: Same outcome regardless of nil vs non-nil behaviour. DESIGN: PASS
+```
+
+### In-Flight Save Wait (NEW — Revision 4, D-9)
+
+**Scenario IW-1: releaseSession would have committed before in-flight save (Revision 3 defect)**
+
+```
+Broken (Revision 3):
+Step 1:   PlayerRemoving save starts → UpdateAsync yields (inFlightSaves not tracked)
+Step 2:   releaseSession: sessionTokens=nil; immediately starts release UpdateAsync
+Step 3:   DataStore serializes: release UpdateAsync runs first
+          → {data, _session:{T_A, released:true}} written
+Step 4:   Save UpdateAsync callback: current._session.released == true (from step 3)
+          But Revision 3 save callback only checks token, not released flag.
+          → callback writes {new_data, _session:{T_A, released:false}} ← re-opens released session
+Step 5:   Another server can now acquire T_A's session (released=false, T_A not expired)
+          → DATA INTEGRITY VIOLATION ← WRONG
+
+Fixed (Revision 4):
+Step 2:   releaseSession: sessionTokens=nil; inFlightSaves[X]==1 > 0 → wait loop
+Step 3:   Save UpdateAsync completes → inFlightSaves[X]=0 → wait exits
+Step 4:   Release UpdateAsync runs AFTER save → {saved_data, _session:{T_A, released:true}} ✅
+No re-opening of session possible. DESIGN: PASS
+```
+
+**Scenario IW-2: inFlightSaves deadline exceeded**
+
+```
+Setup:    inFlightSaves[X] = 1 (save UpdateAsync stuck — DataStore unavailable).
+Step 1:   releaseSession: waits 5 seconds; deadline exceeded; inFlightSaves[X] still 1.
+Step 2:   warn("in-flight saves did not complete within deadline").
+Step 3:   releaseSession proceeds anyway with release UpdateAsync.
+Step 4:   The in-flight save eventually completes (or errors). Its callback:
+          If session not yet re-acquired by another server: token match → writes data.
+          Then release UpdateAsync eventually commits (or already committed): session released.
+          If session re-acquired by another server before save completes:
+          Save callback: token mismatch → returns nil → no write ✅
+Step 5:   On deadline miss, the last-committed state may not include the in-flight save's data.
+          Max data loss: one save interval (60s earnings).
+Expected: Deadline miss is a degraded path, not a correctness violation. Session either
+          released (if save completed first) or re-acquirable after TTL. DESIGN: PASS
+```
+
+### Save/Release Concurrency (NEW — Issue 4)
+
+**Scenario SR-1: Autosave in-flight when PlayerRemoving fires (updated for Revision 4)**
+
+```
+Setup:    Autosave thread for X: state=="active" ✓; token=T_A, snapshot captured; inFlightSaves[X]=1; UpdateAsync yields.
           PlayerRemoving fires.
-Step 1:   releaseSession: state=="active" → "releasing"; sessionTokens[X]=nil; token T_A captured locally.
-Step 2:   DataStore: autosave callback runs first.
-          current._session.token == T_A (token captured, still matches DataStore) → writes data. PASS
-Step 3:   Release UpdateAsync runs: current._session.token == T_A → marks released=true. PASS
-Step 4:   State → "released". loadedData[X] = nil.
-Expected: Data saved exactly once; session released exactly once. DESIGN: PASS
+Step 1:   PlayerRemoving calls savePlayer(X): token=T_A, snapshot captured; inFlightSaves[X]=2; UpdateAsync yields.
+Step 2:   PlayerRemoving calls releaseSession(X): state→"releasing"; sessionTokens[X]=nil.
+          Wait: inFlightSaves[X]==2 > 0 → loops (task.wait(0.05)).
+Step 3:   Autosave UpdateAsync completes; inFlightSaves[X]=1; still > 0 → wait continues.
+Step 4:   PlayerRemoving save UpdateAsync completes; inFlightSaves[X]=0 → wait exits.
+Step 5:   Release UpdateAsync fires: current._session.token==T_A → released=true. PASS
+Step 6:   State → "released". loadedData[X]=nil (cleanup).
+Expected: Both saves committed before release. Session released exactly once. DESIGN: PASS
 ```
 
 **Scenario SR-2: New save attempt after `sessionTokens` cleared**
@@ -347,6 +458,19 @@ The following tests must be executed in Roblox Studio after implementation. None
 | T-18 | TTL-expired same-server session | Studio: same JobId; write old session with `since` > 60s ago | New load acquires session | Kicked as "active on another server" |
 
 ---
+
+## Tests Added for Revision 4 (Architecture Issues D-6 through D-9)
+
+| Test | Issue covered | Scenario reference |
+|---|---|---|
+| Save callback retried after loadedData cleared by releaseSession | D-6 — save snapshot | SS-1 |
+| Two overlapping saves with different snapshots — ordering and staleness | D-6 | SS-2 |
+| refreshSession — non-nil wrong-token result treated as ownership loss | D-8 — refresh verification | RV-1 |
+| refreshSession — nil result treated as ownership loss | D-8 | RV-2 |
+| releaseSession would have committed before in-flight save (Revision 3 defect) | D-9 — in-flight save wait | IW-1 |
+| inFlightSaves deadline exceeded — degraded path | D-9 | IW-2 |
+| Live same-server different-token blocked by TTL rule | D-7 — acquisition contradiction | DS-2 (revised) |
+| Expired same-server session acquirable by TTL rule | D-7 | DS-3 (revised) |
 
 ## Tests Added for the Four Issues (Architecture Revision 3)
 
