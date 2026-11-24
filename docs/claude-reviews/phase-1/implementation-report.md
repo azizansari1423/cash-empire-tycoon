@@ -1,9 +1,9 @@
-# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 8)
+# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 9)
 
 **Date:** 2026-11-24
 **Branch:** `feature/phase-1-data-foundation` (commit b05aa20)
 **Review branch:** `claude-review/phase-1`
-**Status:** Revision 8 — pending approval before implementation
+**Status:** Revision 9 — pending approval before implementation
 
 ---
 
@@ -417,3 +417,75 @@ See architecture §7.2, §7.3, §10.1, §10.3 (Revision 8).
 | D-16 — stale refresh invalidates new session | §7.2/§7.3 guarded only on `playerState == "active"`; a rejoin T_B could be active while old T_A refresh completes → T_B session invalidated/kicked | Dual identity check: `playerState == "active"` AND `sessionTokens[userId] == capturedToken` both required; stale T_A refresh returns false on second check |
 | §4/§10.1 cleanup contradiction | §4 said playerState is cleared; §10.1 set it to "released"/"abandoned" but never nil'd it; §5.1 rejects non-nil playerState → rejoin always blocked | §10.1 cleanup explicitly clears `playerState[userId] = nil`; drain-timeout path defers clear to §6.3 after autosave completes |
 | BindToClose disconnectCount premature decrement | Second caller's `disconnectPlayer` returned immediately (shuttingDown guard); `disconnectCount -= 1` fired before lifecycle complete; BindToClose could exit early | Observing caller waits on `shuttingDown` before returning; counter only decremented after real completion |
+
+---
+
+## Defects Found in Revision 8 Architecture (3464ec5)
+
+### D-17: BindToClose completion still premature during drain timeout (CRITICAL)
+
+**File:** `PlayerDataManager.lua` (design)
+
+Revision 8 §10.1 drain-timeout path clears `shuttingDown[userId] = nil` while `inFlightSaves[userId]` is still > 0 (the autosave is in flight). The Revision 8 fix added a Phase-1 wait (`while shuttingDown`) for observing callers. When `shuttingDown` clears, the observer returns and `disconnectCount -= 1` fires — but the autosave has not completed. BindToClose may therefore exit its wait loop and return before the autosave commits.
+
+**Example:** PlayerRemoving starts disconnect; drain times out after 5s; `shuttingDown[X]=nil` cleared; BindToClose observer exits Phase-1; `disconnectCount` goes to 0; BindToClose outer loop exits; server shuts down with autosave still in flight.
+
+**Fix:** Observing caller's wait must be two-phase:
+1. Phase 1: `while shuttingDown[userId] do task.wait(0.05) end` — wait for lifecycle owner to exit
+2. Phase 2: `while (inFlightSaves[userId] or 0) > 0 do task.wait(0.05) end` — wait for all outstanding saves
+
+`disconnectCount -= 1` fires only after both phases. In the normal path, Phase 2 passes immediately (`inFlightSaves` was cleared to nil in step 7 cleanup). In the drain-timeout path, Phase 2 blocks until the autosave commits. The BindToClose 25-second outer deadline provides the escape hatch if Phase 2 never completes.
+
+See architecture §10.1, §10.3 (Revision 9).
+
+---
+
+### D-18: Async operation tracking is incomplete and undocumented (HIGH)
+
+**File:** `PlayerDataManager.lua` (design)
+
+The design explicitly tracks saves with `inFlightSaves`, but `refreshSession` tasks can also be in flight during and after disconnect. Revision 8 did not explicitly categorize which operations must drain and which may safely outlive cleanup. This creates ambiguity: can BindToClose claim all async operations are done when `inFlightSaves == 0`? The answer is yes — but only if refresh tasks are explicitly justified as safe to leave in flight.
+
+**Categorization (Revision 9 clarification):**
+
+- **Autosave UpdateAsync (`savePlayer`):** tracked by `inFlightSaves`; must drain before BindToClose returns. Safety: captured immutable token+snapshot; callback does not read shared state.
+- **Disconnect save UpdateAsync (`disconnectSave`):** `inFlightSaves[userId] = 1` while running; synchronous within lifecycle (completes before owner clears `shuttingDown`). Safety: same captured-token pattern.
+- **Release UpdateAsync (`releaseSession`):** synchronous within lifecycle; completes before owner clears `shuttingDown`. Not tracked by `inFlightSaves`.
+- **Refresh tasks (`refreshSession` UpdateAsync):** not tracked by `inFlightSaves`; may safely outlive cleanup. Safety: dual identity check in §7.2/§7.3 — stale T_A refresh cannot modify T_B session state. BindToClose does not need to track these.
+
+**Why refresh tasks are not tracked:** Refresh tasks are fire-and-forget (spawned on 20s cycle). Adding a counter would require coordination across the refresh loop and `disconnectPlayer`. The dual identity check provides the same correctness guarantee without that complexity. The tradeoff is accepted: a refresh task may still be running when the server shuts down, but it cannot corrupt per-player state.
+
+See architecture §10.1 D-18 discussion (Revision 9).
+
+---
+
+### D-19: Contradictory shutdown documentation — "returns immediately" vs "waits for owner" (DOCUMENTATION)
+
+**File:** `PlayerDataManager.lua` (design)
+
+The opening paragraph of §10 (Revision 8) states: "A `shuttingDown[userId]` flag ensures only one caller owns the lifecycle; the other returns immediately without competing saves or releases."
+
+§10.3 (Revision 8) corrects this for the BindToClose case: "It loops on `shuttingDown[userId]`..."
+
+Timelines C and D (Revision 8) showed the observer looping, which was correct. But the §10 introduction still said "returns immediately," creating a contradiction in the same document.
+
+**Fix:** §10 introduction updated to: "The second (observing) caller does not return immediately — it waits for the owner to complete all outstanding operations before returning." All timelines and pseudocode are consistent with this. See architecture §10 (Revision 9).
+
+---
+
+## Revised Requirements (Revision 9 additions)
+
+| ID | Requirement | Source defect | Architecture section |
+|---|---|---|---|
+| R26 | The observing caller in `disconnectPlayer` must perform a two-phase wait before returning: (1) wait for `shuttingDown[userId]` to clear (lifecycle owner has exited), then (2) wait for `(inFlightSaves[userId] or 0) == 0` (all tracked saves complete). `disconnectCount -= 1` in BindToClose fires only after both phases. In the normal path, Phase 2 passes immediately. In the drain-timeout path, Phase 2 blocks until the stalled autosave commits or the BindToClose 25-second outer deadline fires. | D-17 | §10.1 (step 1 pseudocode), §10.3 |
+| R27 | The design must explicitly document which async operations are tracked by `inFlightSaves`, which may safely outlive cleanup, and what prevents untracked operations from corrupting newer sessions. Saves (`savePlayer`, `disconnectSave`, `releaseSession`) must drain before BindToClose returns. Refresh tasks (`refreshSession`) are exempt from tracking because the dual identity check in §7.2/§7.3 prevents them from modifying any state belonging to a different session. | D-18 | §10.1 D-18 discussion, §10.3 |
+
+---
+
+## Summary of Changes from Revision 8 (3464ec5)
+
+| Issue | Revision 8 problem | Revision 9 fix |
+|---|---|---|
+| D-17 — BindToClose premature completion during drain-timeout | Observing caller's Phase-1 wait exited when shuttingDown cleared; autosave still in flight; disconnectCount decremented prematurely | Two-phase wait: Phase 1 (shuttingDown), then Phase 2 (inFlightSaves == 0); counter decremented only after both phases |
+| D-18 — async operation tracking undocumented | No explicit statement of which operations must drain vs may safely outlive cleanup | §10.1 table: saves tracked/must drain; refresh tasks untracked/safe to outlive (dual identity check justification) |
+| D-19 — contradictory §10 introduction | §10 intro said "other returns immediately"; §10.3 and timelines showed waiting | §10 intro corrected to describe two-phase wait; all timelines consistent |

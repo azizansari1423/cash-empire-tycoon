@@ -1,8 +1,8 @@
-# Phase 1 Test Results — Cash Empire Tycoon (Revision 8)
+# Phase 1 Test Results — Cash Empire Tycoon (Revision 9)
 
 **Date:** 2026-11-24
 **Commit under review:** b05aa20 (`feature/phase-1-data-foundation`)
-**Review revision:** 8
+**Review revision:** 9
 **Status:** Test plan revised — runtime tests not yet executed
 
 > **Note:** All test results in this document are design-level analysis. No runtime tests have been executed. Test scenarios marked PASS/FAIL reflect whether the revised design is expected to handle them correctly, not observed runtime behaviour.
@@ -19,8 +19,8 @@
 | Session lock prevents duplicate writes | Save callback: `current._session.token ~= token` → return nil → no write | Yes |
 | Stale lock (TTL expired) allows new server to acquire | Acquisition callback: `(now - sess.since) >= LOCK_TTL` → available for acquisition | Yes |
 | `addCash`/`spendCash` blocked after session loss | `invalidated[userId]=true` → `getData` returns nil → operations return false/nil | Yes |
-| Duplicate disconnect ownership rejected | `shuttingDown[userId]` guard: first caller owns lifecycle; second caller waits for `shuttingDown` to clear before returning (R25) — `disconnectCount` only decremented after real completion | Yes |
-| BindToClose completes within 25 s deadline | Each player gets a concurrent `task.spawn(disconnectPlayer)` — per-player disconnect is serialized (drain→save→release); BindToClose waits up to 25 s for all to finish; counter accurate because observers wait-on-owner | Yes |
+| Duplicate disconnect ownership rejected | `shuttingDown[userId]` guard: first caller owns lifecycle; second (observing) caller performs two-phase wait: (1) until `shuttingDown` clears, (2) until `inFlightSaves == 0` — `disconnectCount` decremented only after both phases (R26) | Yes |
+| BindToClose completes within 25 s deadline | Each player gets a concurrent `task.spawn(disconnectPlayer)`; observers use two-phase wait; counter reflects actual save completion; 25 s outer deadline provides exit if saves never complete (logs warning, allows shutdown) | Yes |
 | Player can rejoin same server after disconnect | `playerState[userId]` is cleared to nil after all async ops complete; `loadPlayer` accepts nil state (R24); stale refresh from old session cannot invalidate new session (R23) | Yes |
 | Legacy records (no `_session`) load correctly | Acquisition callback: `current._session == nil` → treated as available; all existing fields preserved | Yes |
 | `_session` never in `getData` return value | `loadedData[userId]` populated without `_session` at load time; `getData` returns that table | Yes |
@@ -308,36 +308,42 @@ DESIGN: PASS
 
 ### Single-Owner Disconnect and Save Serialization (NEW — Revision 5, D-12)
 
-**Scenario SO-1: PlayerRemoving fires first; BindToClose observes ownership**
+**Scenario SO-1: PlayerRemoving fires first; BindToClose observes ownership (updated — Revision 9, D-19)**
 
 ```
 Setup:    Server shutdown: PlayerRemoving fires for Player X.
 Step 1:   PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle starts.
 Step 2:   BindToClose fires. Iterates Players; Player X is in list.
-          disconnectPlayer(X) → shuttingDown[X]==true → return immediately ✅
-Step 3:   PlayerRemoving lifecycle: drain→save→release completes.
+          disconnectPlayer(X) → shuttingDown[X]==true → two-phase wait begins.
+          Phase-1: while shuttingDown[X] do task.wait(0.05) end → loops (does NOT decrement disconnectCount).
+Step 3:   PlayerRemoving lifecycle: drain→save→release→cleanup completes; shuttingDown[X]=nil.
+Step 4:   BindToClose observer: Phase-1 exits. Phase-2: inFlightSaves[X]==nil → exits immediately.
+          disconnectPlayer returns → disconnectCount -= 1 ✅ (after all operations complete).
 Expected: Exactly one save, one release. No competing saves. DESIGN: PASS
 ```
 
-**Scenario SO-2: BindToClose fires first; PlayerRemoving observes ownership**
+**Scenario SO-2: BindToClose fires first; PlayerRemoving observes ownership (updated — Revision 9, D-19)**
 
 ```
 Setup:    BindToClose fires before PlayerRemoving has called disconnectPlayer.
 Step 1:   BindToClose: task.spawn → disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle.
 Step 2:   PlayerRemoving fires.
-          disconnectPlayer(X) → shuttingDown[X]==true → return immediately ✅
-Step 3:   BindToClose lifecycle: drain→save→release completes.
+          disconnectPlayer(X) → shuttingDown[X]==true → two-phase wait begins.
+          Phase-1: loops on shuttingDown; Phase-2: loops on inFlightSaves.
+Step 3:   BindToClose lifecycle: drain→save→release→cleanup completes; shuttingDown[X]=nil.
+Step 4:   PlayerRemoving observer: both phases exit; disconnectPlayer returns. ✅
 Expected: Exactly one save, one release. No competing saves. DESIGN: PASS
 ```
 
-**Scenario SO-3: PlayerRemoving fires first but BindToClose reached the spawn point before shuttingDown was set**
+**Scenario SO-3: Cooperative-scheduler guarantee prevents shuttingDown race (updated — Revision 9, D-19)**
 
 ```
 Setup:    Race: BindToClose task.spawn fires at the exact moment PlayerRemoving starts disconnectPlayer.
           Roblox cooperative scheduler: only one coroutine runs at a time between yields.
 Step 1:   PlayerRemoving (runs first): disconnectPlayer(X) → sets shuttingDown[X]=true; yields at drain wait.
-Step 2:   BindToClose spawn resumes: disconnectPlayer(X) → shuttingDown[X]==true → return immediately ✅
-          (Cooperative scheduler means shuttingDown is set before any yield, so no actual race.)
+Step 2:   BindToClose spawn resumes: disconnectPlayer(X) → shuttingDown[X]==true → two-phase wait begins.
+          (Cooperative scheduler means shuttingDown is set before any yield, so no actual race on the flag.)
+Step 3:   PlayerRemoving lifecycle completes; BindToClose observer's two-phase wait exits. ✅
 Expected: shuttingDown assignment is atomic at coroutine boundaries. No race. DESIGN: PASS
 ```
 
@@ -500,21 +506,66 @@ Step 1:   §7.3: first check: playerState[X]=="active" → passes.
 Expected: T_A's expired lock does not invalidate or kick T_B session. DESIGN: PASS
 ```
 
-**Scenario BC-1: BindToClose with PlayerRemoving owning lifecycle — wait-for-owner (NEW — Revision 8, D-16)**
+**Scenario BC-1: BindToClose with PlayerRemoving owning lifecycle; normal completion — two-phase wait (Revision 9)**
+
+See Timeline C for detailed step-by-step. Summary:
 
 ```
-Setup:    Server shutdown: PlayerRemoving fires; BindToClose fires.
-Step 1:   PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle starts; yields at drain.
-Step 2:   BindToClose: task.spawn → disconnectPlayer(X) → shuttingDown[X]==true →
-          observing caller: while shuttingDown[X] do task.wait(0.05) end → loops (does NOT decrement disconnectCount).
-Step 3:   PlayerRemoving lifecycle completes: cleanup sets shuttingDown[X]=nil.
-Step 4:   BindToClose's spawn: while loop exits → disconnectPlayer returns → disconnectCount -= 1 ✅
+PlayerRemoving owns lifecycle (drain+save+release).
+BindToClose observer: Phase-1 wait on shuttingDown; Phase-2 wait on inFlightSaves.
+Normal path: Phase-2 immediate (inFlightSaves nil after step-7 cleanup).
+Observer returns → disconnectCount -= 1 ✅ (after all operations complete).
+DESIGN: PASS
+```
 
-Broken (Revision 7) behaviour:
-          Step 2: returns immediately → disconnectCount -= 1 fires before lifecycle complete.
-          If all players had PlayerRemoving in progress, disconnectCount reached 0 → BindToClose exited
-          while saves still running. ← D-16 / premature exit
-DESIGN: PASS (Revision 8 — observe-and-wait)
+**Scenario BC-2: PlayerRemoving owns; drain times out; autosave in flight; BindToClose must not report false completion (NEW — Revision 9, D-17)**
+
+See Timeline G for detailed step-by-step. Summary:
+
+```
+PlayerRemoving: drain timeout → shuttingDown[X]=nil; inFlightSaves[X]=1 still.
+BindToClose observer: Phase-1 exits (shuttingDown nil). Phase-2: inFlightSaves=1 → loops.
+disconnectCount NOT decremented until autosave completes (inFlightSaves→0). ✅
+
+Broken (Revision 8): Phase-1 only → observer returned immediately after Phase-1 →
+disconnectCount -= 1 while autosave still in flight ← D-17
+DESIGN: PASS (Revision 9)
+```
+
+**Scenario BC-3: BindToClose owns; drain times out; PlayerRemoving observes; same two-phase wait (NEW — Revision 9, D-17)**
+
+See Timeline H for detailed step-by-step. Summary:
+
+```
+BindToClose: drain timeout → shuttingDown[X]=nil; inFlightSaves[X]=1 still.
+PlayerRemoving observer: same two-phase wait; Phase-2 loops until autosave completes. ✅
+DESIGN: PASS
+```
+
+**Scenario BC-4: Autosave completes after drain timeout; playerState cleared; same-server rejoin enabled (NEW — Revision 9, D-17)**
+
+See Timeline I for detailed step-by-step. Summary:
+
+```
+Drain timeout: playerState[X]="abandoned"; inFlightSaves[X]=1; shuttingDown[X]=nil.
+Autosave eventually commits: inFlightSaves[X]→0; §6.3 clears playerState[X]=nil.
+Player rejoins: loadPlayer → playerState[X]==nil → allowed; new session T_B starts. ✅
+DESIGN: PASS
+```
+
+**Scenario BC-5: BindToClose 25-second deadline reached with saves still outstanding (NEW — Revision 9, D-17)**
+
+See Timeline J for detailed step-by-step. Summary:
+
+```
+Two players; both stalled autosaves in drain-timeout path.
+BindToClose observers in Phase-2 wait; autosaves never complete within 25s.
+Outer loop: os.clock()-deadline >= 25s → exits. disconnectCount=2 > 0.
+warn("[DataManager] BindToClose: 25s deadline reached with 2 player(s) with
+      outstanding saves or disconnect in progress.")
+BindToClose returns. Stalled saves abandoned when server shuts down.
+Data loss documented as degraded-path outcome.
+DESIGN: PASS (degraded path with correct logging)
 ```
 
 ---
@@ -548,10 +599,13 @@ Note:     sessionTokens nil is defence-in-depth only; the state check alone is s
 ```
 Setup:    Server shutdown: PlayerRemoving and BindToClose both fire for Player X.
 Step 1:   Thread A (PlayerRemoving): disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle.
-Step 2:   Thread B (BindToClose): disconnectPlayer(X) → shuttingDown[X]==true → return immediately. PASS
-Step 3:   Thread A lifecycle: drain→disconnectSave→releaseSession → state→"released". PASS
+Step 2:   Thread B (BindToClose): disconnectPlayer(X) → shuttingDown[X]==true → two-phase wait begins.
+          Phase-1: loops on shuttingDown. Phase-2: loops on inFlightSaves.
+Step 3:   Thread A lifecycle: drain→disconnectSave→releaseSession→cleanup → shuttingDown[X]=nil.
+Step 4:   Thread B observer: both phases exit → disconnectPlayer returns → disconnectCount -= 1 ✅
 Expected: Exactly one save, one release. No competing saves or releases. DESIGN: PASS
-Note:     See SO-1/SO-2 for detailed timelines of PlayerRemoving-first and BindToClose-first orderings.
+Note:     See SO-1/SO-2/BC-1 for detailed timelines. "return immediately" (Revision 8) replaced by
+          two-phase wait (Revision 9, D-17/D-19).
 ```
 
 **Scenario SR-4: Release UpdateAsync fails all retries**
@@ -678,8 +732,9 @@ Autosave: savePlayer → state check: "invalidated" ≠ "active" → return fals
 
 ```
 PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]=true; drain→disconnectSave→releaseSession.
-               state→"released"; loadedData[X]=nil.
-BindToClose: disconnectPlayer(X) → shuttingDown[X]==true → return immediately (no-op).
+               state→"released"; loadedData[X]=nil; shuttingDown[X]=nil.
+BindToClose: disconnectPlayer(X) → shuttingDown[X]==true → two-phase wait; both phases exit
+             immediately (normal path). disconnectCount -= 1 ✅ (after all operations confirmed done).
 DESIGN: PASS
 
 Historical (pre-Revision 5): PlayerRemoving called savePlayer+releaseSession directly;
@@ -724,6 +779,19 @@ The following tests must be executed in Roblox Studio after implementation. None
 | T-18 | TTL-expired same-server session | Studio: same JobId; write old session with `since` > 60s ago | New load acquires session | Kicked as "active on another server" |
 
 ---
+
+## Tests Added for Revision 9 (Architecture Issues D-17, D-18, D-19)
+
+| Test | Issue covered | Scenario reference |
+|---|---|---|
+| PlayerRemoving owns; BindToClose observes; two-phase wait; normal completion | D-19 — SO-1 "return immediately" corrected | BC-1, SO-1 (updated) |
+| PlayerRemoving owns; drain times out; autosave in flight; BindToClose Phase-2 blocks until save completes | D-17 — premature disconnectCount decrement in drain-timeout path | BC-2 (new), Timeline G |
+| BindToClose owns; drain times out; PlayerRemoving observes; same two-phase wait | D-17 | BC-3 (new), Timeline H |
+| Autosave completes after drain timeout; §6.3 clears playerState=nil; same-server rejoin enabled | D-17 | BC-4 (new), Timeline I |
+| BindToClose 25s deadline reached with saves outstanding; warn logged; degraded-path documented | D-17 | BC-5 (new), Timeline J |
+| Old refresh completes after T_B active; dual identity check blocks T_B state modification | D-18 — refresh task exempted from drain (dual check safety) | RJ-1/RJ-2/RJ-3 (preserved from R8) |
+| Explicit categorization: saves tracked (must drain); refresh tasks not tracked (safe to outlive) | D-18 | §10.1 D-18 async operations table |
+| SO-1/SO-2/SO-3/SR-3/S-1 updated: "return immediately" → two-phase wait | D-19 — contradictory shutdown documentation | SO-1, SO-2, SO-3, SR-3, S-1 (updated) |
 
 ## Tests Added for Revision 8 (Architecture Issues D-16)
 
