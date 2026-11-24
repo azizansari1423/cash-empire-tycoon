@@ -610,19 +610,35 @@ T_B rejoin proceeds; session expires by TTL.
 DESIGN: PASS
 ```
 
-**Scenario DT-4: T_A completion races with T_B load; T_B cannot start until T_A safely relinquishes state (NEW — Revision 10, D-20)**
+**Scenario DT-4: T_A completion races with T_B load; T_B cannot start until T_A safely relinquishes state (NEW — Revision 10, D-20; expanded — D-20 deep review)**
 
 ```
-Proof that the §5.1 ordering invariant prevents the race:
-§5.1: loadPlayer rejects if playerState[X] ~= nil.
-In drain-timeout path: playerState[X]="abandoned" (non-nil) until §6.3 Step 4 clears it.
-§6.3 Step 4 fires only AFTER Step 1 (decrement) completes — i.e., after T_A's save finishes.
-Therefore: T_B cannot call loadPlayer until T_A's §6.3 Step 4 has run.
-By that point: T_A's sessionTokens[X] is nil; inFlightSaves[X] is 0.
-T_B starts with a clean slate; T_A's counter slot cannot affect T_B's accounting.
+Structural proof (both paths):
+
+Normal path:
+  §10.1 drain waits until inFlightSaves[X]=0 — all T_A autosaves complete before proceeding.
+  disconnectSave runs: inFlightSaves[X]=1→0 on completion (synchronous).
+  Step 7 cleanup: playerState[X]=nil (enables T_B load); inFlightSaves[X]=nil.
+  By the time playerState=nil, every T_A save has completed and decremented.
+  T_B starts with inFlightSaves=nil. No T_A save is ever "very late" after a normal release.
+
+Drain-timeout path:
+  §5.1: loadPlayer rejects if playerState[X] ~= nil.
+  playerState[X]="abandoned" (non-nil) until §6.3 Step 4 clears it.
+  §6.3 Step 4 fires only when inFlightSaves[X]==0 — AFTER Step 1 decremented the last counter slot.
+  Step 4 sets playerState[X]=nil in the same call that decremented the last counter.
+  T_B can only load AFTER that final save completed and decremented.
+  No other T_A save is in flight (Step 4 requires counter==0 to fire).
 
 Invariant: "T_B never starts while T_A's inFlightSaves slot is live."
-DESIGN: PASS (structural guarantee from §5.1 + §6.3 ordering)
+In both paths this is structurally guaranteed — not merely prevented, but impossible.
+
+Safety implication: If this invariant were violated (scheduler anomaly, future code change),
+T_A's Step 1 decrement would reduce T_B's counter, potentially allowing Phase-2 to exit
+before T_B's save completes. Step 2 identity check blocks further T_A state modifications,
+but cannot undo the decrement. The structural guarantee must hold.
+
+DESIGN: PASS (structural impossibility proven for both normal and drain-timeout paths)
 ```
 
 **Scenario DT-5: Stale T_A save completion after T_B is fully active; Step-2 identity check blocks T_A (NEW — Revision 10, D-20)**
@@ -631,23 +647,115 @@ See Timeline L for detailed step-by-step. Summary:
 
 ```
 T_B active: playerState[X]="active"; sessionTokens[X]=T_B.
-T_A's very-late save fires (edge case — normal path, not drain-timeout).
+T_A's very-late save fires (structural impossibility per DT-4 — documented as defence-in-depth only).
 §6.3 Step 1: inFlightSaves[X] decremented.
 §6.3 Step 2: sessionTokens[X]==T_B ≠ capturedToken(T_A) → stale completion → return false. ✅
 T_B state untouched; no invalidation, no kick.
 DESIGN: PASS (defence-in-depth; §5.1+two-phase-wait prevent this in practice)
 ```
 
-**Scenario DT-6: BindToClose observer waits correctly for old save; 25-second deadline applies (NEW — Revision 10, D-20)**
-
-Already covered by BC-2 (normal drain-timeout, Phase-2 wait) and BC-5 (25s deadline). The D-20 fix ensures that Phase-2 properly drains the old save and that §6.3 clears state correctly when the save completes. No additional scenario needed beyond BC-2/BC-5; referenced here for traceability.
+**Scenario DT-6: §6.3 Step 4 → Phase-2 signal chain; BindToClose observer exits after save completes (REVISED — D-20 deep review, M-3)**
 
 ```
-See BC-2: Phase-2 loops on inFlightSaves while T_A's autosave is in flight.
-See BC-5: 25s deadline fires if Phase-2 never exits; degraded path logged.
-D-20 connection: §6.3 (not Phase-2) is what actually clears playerState=nil when the
-save completes. Phase-2 observes inFlightSaves dropping to 0, which is set by §6.3 Step 1.
-DESIGN: PASS (combined BC-2/BC-5 coverage, updated §6.3 handling)
+Preconditions:
+  T_A autosave in flight: inFlightSaves[X]=1; playerState[X]="abandoned"; sessionTokens[X]=T_A.
+  disconnectPlayer owner has exited (shuttingDown[X]=nil).
+  BindToClose observer in Phase-2: while (inFlightSaves[X] or 0) > 0 do task.wait(0.05) end.
+
+Signal chain when T_A autosave completes:
+  §6.3 Step 1: inFlightSaves[X] = math.max(0, 1 - 1) = 0.
+  §6.3 Step 2: sessionTokens[X]==T_A==capturedToken → identity check passes.
+  §6.3 Step 3: confirmedSessionLoss=false → skip.
+  §6.3 Step 4: playerState[X]=="abandoned" AND inFlightSaves[X]==0
+               → sessionTokens[X]=nil; inFlightSaves[X]=nil; playerState[X]=nil.
+
+Phase-2 observer next iteration:
+  (inFlightSaves[X] or 0) = (nil or 0) = 0 → 0 > 0 is false → Phase-2 loop exits.
+  disconnectPlayer observer returns → disconnectCount -= 1 ✅
+
+Ordering guarantee:
+  §6.3 Step 4 fires before Phase-2 exits. Rejoin eligibility (playerState=nil) and
+  BindToClose count decrement are both correct.
+
+DESIGN: PASS (concrete signal chain: §6.3 Step 1 → Step 4 → Phase-2 exit → counter decrement)
+```
+
+**Scenario DT-7: §6.3 Step 4 counter guard — only last save triggers cleanup (NEW — D-20 deep review)**
+
+```
+Precondition (theoretical — single autosave loop serialises saves, but validates protocol):
+  Two saves in flight: inFlightSaves[X]=2; playerState[X]="abandoned"; sessionTokens[X]=T_A.
+  Both saves captured capturedToken=T_A.
+
+Save #1 completes first:
+  Step 1: inFlightSaves[X] = 2 - 1 = 1.
+  Step 2: sessionTokens[X]==T_A → passes.
+  Step 3: confirmedSessionLoss=false → skip.
+  Step 4: inFlightSaves[X]==1 ≠ 0 → condition false → Step 4 NOT triggered.
+  Step 5: returns saveSucceeded. playerState unchanged ("abandoned").
+
+Save #2 completes last:
+  Step 1: inFlightSaves[X] = 1 - 1 = 0.
+  Step 2: sessionTokens[X]==T_A → passes.
+  Step 3: skip.
+  Step 4: inFlightSaves[X]==0 AND playerState=="abandoned"
+          → sessionTokens[X]=nil; inFlightSaves[X]=nil; playerState[X]=nil. ✅
+
+Result: Cleanup fires exactly once; only after all saves complete. No premature state clearing.
+Note:   The current design has at most one autosave in flight per player (autosave loop is
+        sequential; disconnectSave runs after drain). This test validates the protocol's
+        correctness under multiple concurrent saves for future multi-call scenarios.
+DESIGN: PASS (protocol handles N in-flight saves; only the last triggers drain-timeout cleanup)
+```
+
+**Scenario DT-8: §6.3 Step 4 idempotency — second execution blocked by Step 2 (NEW — D-20 deep review)**
+
+```
+Setup: Two save coroutines both in drain-timeout path; playerState[X]="abandoned"; inFlightSaves[X]=2.
+
+Coroutine A fires first:
+  Step 1: inFlightSaves[X] = 2 - 1 = 1.
+  Step 4: inFlightSaves==1 ≠ 0 → not triggered. Returns.
+
+Coroutine B fires second (last save):
+  Step 1: inFlightSaves[X] = 1 - 1 = 0.
+  Step 2: sessionTokens[X]==T_A → passes.
+  Step 4: abandoned AND counter==0 → sessionTokens[X]=nil; inFlightSaves[X]=nil; playerState[X]=nil.
+
+Hypothetical third execution (e.g., stale callback, scheduler anomaly) after Step 4 cleared state:
+  Step 2: sessionTokens[X]==nil ≠ capturedToken(T_A) → stale → return false immediately.
+  Step 4 not reached; state unchanged (already nil or T_B's).
+
+Result: Step 4 is idempotent — a second execution is blocked by Step 2 before it can clear T_B's state.
+DESIGN: PASS (Step 2 identity check protects Step 4 idempotency)
+```
+
+**Scenario DT-9: Risk 8 — in-flight refresh extends TTL after disconnect; local state unaffected (NEW — D-20 deep review, L-1)**
+
+```
+Preconditions:
+  T_A active; refresh task starts: local capturedToken=T_A; UpdateAsync yields inside callback.
+  disconnectPlayer fires: activeLocks[X]=nil; drain timeout; playerState[X]="abandoned".
+  sessionTokens[X]=T_A preserved (D-20 fix).
+
+Refresh callback completes while UpdateAsync is still in flight:
+  callback: current._session.token==T_A==capturedToken → match.
+  callback writes: newRecord._session.since = os.time() → DataStore updated. ← Risk 8
+
+§7.2 result handler fires:
+  First check: playerState[X]=="abandoned" ≠ "active" → return false. ✅
+  Local state: playerState, lastRefresh, invalidated — all untouched. ✅
+
+DataStore state:
+  _session.since = now (time of refresh write, NOT time of disconnect start).
+  TTL countdown: another server must wait LOCK_TTL (60s) from this refresh write.
+  Worst case: refresh completed immediately after disconnect → up to ~20s extra TTL delay.
+
+D-20 interaction: D-20 preserves sessionTokens in memory but does not change the refresh
+  callback's captured token or its DataStore write behaviour. Risk 8 is unaffected by D-20.
+
+Result: Local state correctly protected. DataStore TTL extended (accepted risk — see §15 Risk 8).
+DESIGN: PASS (local state) / ACCEPTED RISK (DataStore TTL delay, unmitigated by D-20)
 ```
 
 ---
@@ -872,7 +980,13 @@ The following tests must be executed in Roblox Studio after implementation. None
 | T_A autosave exhausts retries after drain timeout; confirmedSessionLoss=false; cleanup clears state | D-20 | DT-3 (new) |
 | §5.1 ordering invariant proves T_B cannot start while T_A's inFlightSaves slot is live | D-20 — counter ownership proof | DT-4 (new) |
 | Stale T_A save completion after T_B active; Step-2 identity check blocks T_A (defence-in-depth) | D-20 — §6.3 Step 2 dual identity check | DT-5 (new), Timeline L |
-| BindToClose observer waits correctly for old save; 25s deadline applies (traceability to D-20) | D-20 | DT-6 (references BC-2/BC-5) |
+| BindToClose §6.3 Step 4 → Phase-2 signal chain; concrete step-by-step (revised from references-only) | D-20 deep review (M-3) | DT-6 (revised) |
+| §6.3 Step 4 counter guard — only last save triggers cleanup; Step 4 not triggered prematurely | D-20 deep review | DT-7 (new) |
+| §6.3 Step 4 idempotency — second execution blocked by Step 2 identity check | D-20 deep review | DT-8 (new) |
+| Risk 8 concrete scenario — in-flight refresh extends TTL; local state protected; D-20 no-interaction confirmed | D-20 deep review (L-1) | DT-9 (new) |
+| DT-4 expanded with both-path structural impossibility proof | D-20 deep review (M-1) | DT-4 (expanded) |
+| Timeline L note corrected to state structural impossibility | D-20 deep review (M-1) | Timeline L (updated) |
+| §6.3 Step 4 adds inFlightSaves[userId]=nil for consistency with step-7 cleanup | D-20 deep review (M-2) | §6.3 Step 4 (updated) |
 | SR-1 updated: sessionTokens NOT cleared in disconnectPlayer step 2 (D-20 fix) | D-20 | SR-1 (updated) |
 | All timelines (A/B/C/D/E/F/G/H/I) updated: sessionTokens cleared in step 7 / §6.3, not step 2 | D-20 | Timelines A–L (updated) |
 

@@ -361,6 +361,7 @@ if confirmedSessionLoss:
 -- This is the ONLY point where sessionTokens is cleared in the drain-timeout path.
 if playerState[userId] == "abandoned" and inFlightSaves[userId] == 0:
     sessionTokens[userId] = nil      -- clear session identity; kept alive until this point for Step 2
+    inFlightSaves[userId] = nil      -- set to nil for consistency with step-7 cleanup (D-20 deep review, M-2)
     playerState[userId] = nil        -- enable same-server rejoin (§5.1 accepts nil state)
     -- loadedData[userId] was already cleared by disconnectPlayer drain-timeout cleanup (§10.1 step 3)
     return saveSucceeded
@@ -377,10 +378,10 @@ return saveSucceeded
 
 | Step | Action | Rationale |
 |---|---|---|
-| 1 — Decrement | `inFlightSaves[userId] -= 1` (always) | Releases the counter slot this operation owns; must precede all state checks |
+| 1 — Decrement | `inFlightSaves[userId] -= 1` (always) | Releases the counter slot this operation owns; **must precede Step 2**: if Step 2 returned `false` before Step 1, `inFlightSaves` would stay > 0 permanently → Phase-2 observer loops forever → BindToClose deadlocks |
 | 2 — Identity check | `sessionTokens[userId] == token` | Prevents stale T_A completion from modifying T_B state; requires `sessionTokens` preserved through step 2 of disconnectPlayer |
 | 3 — Session-loss | Invalidate only if state == "active" | No kick when player already disconnecting/abandoned |
-| 4 — Drain-timeout cleanup | Clear `sessionTokens`, `playerState` when abandoned + counter == 0 | Only safe after Steps 1–3; `sessionTokens` cleared here (not earlier) |
+| 4 — Drain-timeout cleanup | Clear `sessionTokens`, `inFlightSaves`, `playerState` when abandoned + counter == 0 | Only safe after Steps 1–3; `sessionTokens` cleared here (not earlier); `inFlightSaves` set to nil here for consistency with step-7 cleanup |
 | 5 — Normal return | `return saveSucceeded` | Regular autosave completion for active session |
 
 **Token-mismatch non-nil result:** If `UpdateAsync` returns the existing DataStore value (not nil) when our callback returned nil, `result._session.token` will be another server's token. The `ok and` branch (above) catches this: `result ~= nil but token ~= our token` → `confirmedSessionLoss = true`. This is the second path that correctly detects session loss without relying on `result == nil` alone.
@@ -1196,10 +1197,19 @@ T1  §6.3 Step 1: inFlightSaves[X] decremented → 0 (releases T_A's slot).
 T2  §6.3 Step 2: sessionTokens[X]==T_B ≠ capturedToken(T_A) → stale completion → return false. ✅
     T_B's playerState, inFlightSaves, invalidated, and sessionTokens are all untouched.
 Expected: Stale T_A save completion cannot modify T_B session state. PASS
-Note: This case requires T_B to have loaded before §6.3 fires; possible if T_A released normally
-      (not drain-timeout) and an in-flight save completed very late. The two-phase wait and §5.1 guard
-      prevent T_B from loading while T_A's save is still in the counter — this scenario is primarily
-      a defence-in-depth validation.
+Note: Per the §5.1 + §6.3 ordering invariant this scenario is structurally impossible
+      (D-20 deep review, M-1):
+      — Normal path: drain waits until inFlightSaves=0 (all T_A autosaves done);
+        disconnectSave runs and decrements to 0; step 7 sets playerState=nil.
+        By the time T_B can load, every T_A save has completed. No save is "very late."
+      — Drain-timeout path: §5.1 blocks T_B until §6.3 Step 4 fires, which requires
+        inFlightSaves=0. Step 4 sets playerState=nil in the same call that decremented
+        the last counter slot. T_B starts only after that last save finished.
+      In both paths: T_B is never active while a T_A save is in flight.
+      If this scenario fired via a scheduler anomaly, Step 1 would decrement T_B's
+      inFlightSaves counter — Phase-2 could then exit before T_B's save completes.
+      Step 2 catches stale completions but cannot undo the decrement. The structural
+      guarantee must hold. DT-4 (formal proof) and DT-5 (defence-in-depth) document this.
 ```
 
 ---
@@ -1332,7 +1342,9 @@ When `disconnectPlayer` clears `activeLocks[userId]`, a currently-running `refre
 
 **Normal path is unaffected:** `releaseSession` writes `released=true`, and another server can acquire immediately regardless of `_session.since`.
 
-**Mitigation (optional, not in current design):** The refresh task could check `playerState[userId] == "active"` before writing and return early if not. This mitigation is not part of the current architecture.
+**D-20 interaction (confirmed no change):** D-20 preserves `sessionTokens[userId]` through `disconnectPlayer` step 2, but this does not affect Risk 8. The refresh task already captured its token from `sessionTokens` before `disconnectPlayer` ran. D-20 changes what `sessionTokens` holds in memory; it does not change what the refresh callback captured or what it writes to DataStore. The dual identity check in §7.2 correctly prevents local state corruption but cannot prevent the DataStore `_session.since` write that already occurred inside the callback. Risk 8 is unaffected by D-20.
+
+**Mitigation (optional, not in current design):** The refresh task could check `playerState[userId] == "active"` before the `UpdateAsync` call and return early if not. This reduces the window (skips the call if already disconnecting) but does not fully eliminate the risk — a yield inside `UpdateAsync` can still race with a `disconnectPlayer` call that starts after the check. This mitigation is not part of the current architecture.
 
 ---
 

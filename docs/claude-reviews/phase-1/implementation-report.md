@@ -558,3 +558,93 @@ See architecture §6.3, §10.1 step 2, §10.1 step 7, Timelines E/G/H/I/K/L (Rev
 | D-20 — §6.3 `confirmedSessionLoss` unconditionally sets "invalidated" | No dual identity check on save completion; `confirmedSessionLoss` fired regardless of playerState; "abandoned" → "invalidated" blocked rejoin permanently | Dual identity check (sessionTokens==capturedToken) added as Step 2; Step 3 applies invalidation only when state=="active"; Step 4 drain-timeout cleanup clears sessionTokens+playerState when abandoned+counter==0 |
 | D-20 — `sessionTokens` cleared in step 2 prevented §6.3 identity check | `disconnectPlayer` cleared `sessionTokens[userId]=nil` before drain wait; §6.3 saw nil, identity check always failed, state never cleared → permanent block | Step 2 no longer clears sessionTokens; Step 7 cleanup and §6.3 Step 4 clear it at the correct point |
 | D-20 — `player:Kick()` called without nil check | §6.3 used the outer `player` parameter, which may be nil if the player left before the save completed | Changed to `Players:GetPlayerByUserId(tonumber(userId))` with nil check before kick |
+
+---
+
+## D-20 Deep Code-Level Review (Revision 10, commit 52ab58f)
+
+**Review objective:** Adversarial validation that D-20 completely resolves the §6.3 session-invalidation and drain-timeout race conditions without introducing regressions. All 11 adversarial scenarios from the review request were traced.
+
+**Method:** Each claim in §6.3, §10.1, Timelines E/G/H/I/K/L, and DT-1–DT-6 was validated independently. The cooperative Roblox scheduler (single coroutine at a time between yields) was used to bound race windows. All paths through §6.3 were traced with and without `confirmedSessionLoss`, with and without each state value.
+
+**Verdict: PASS WITH RISKS**
+
+| Severity | Count | IDs |
+|---|---|---|
+| Critical | 0 | — |
+| High | 0 | — |
+| Medium | 3 | M-1, M-2, M-3 |
+| Low | 1 | L-1 |
+
+---
+
+### Finding M-1: Timeline L states the scenario is "possible if T_A released normally" — structurally false
+
+**Severity:** Medium — documentation error that misrepresents the safety margin of Step 1
+
+**Location:** `architecture.md` Timeline L note (Revision 10)
+
+**Finding:** The note claimed "possible if T_A released normally (not drain-timeout) and an in-flight save completed very late." This is incorrect. The scenario (T_A save completing while T_B is active) is structurally impossible in both paths:
+
+- **Normal path:** `disconnectPlayer` drain waits until `inFlightSaves=0`; `disconnectSave` completes (counter goes 1→0); step 7 cleanup sets `playerState=nil`. By the time T_B can load, every T_A save has completed and decremented. No save is "very late."
+- **Drain-timeout path:** §5.1 blocks T_B until §6.3 Step 4 fires. Step 4 requires `inFlightSaves==0`. It fires in the same call that decremented the last counter slot. T_B cannot start until that exact save finished.
+
+**Safety implication:** If the invariant were violated (scheduler anomaly, future code change), T_A's Step 1 decrement would reduce T_B's `inFlightSaves` counter — Phase-2 could then exit before T_B's save completes. Step 2 blocks further T_A state modifications but cannot undo the decrement.
+
+**Fix applied:** Timeline L note replaced with structural impossibility proof (architecture.md); DT-4 expanded with explicit both-path proof (test-results.md).
+
+---
+
+### Finding M-2: §6.3 Step 4 leaves `inFlightSaves[userId] = 0`, inconsistent with §4 cleanup guarantee
+
+**Severity:** Medium — documentation inconsistency; harmless at runtime
+
+**Location:** `architecture.md` §6.3 Step 4 and §4 cleanup note
+
+**Finding:** §4 states: "After `disconnectPlayer` completes (whether via normal release or any terminal path), all per-player state tables are cleared to nil: ..., `inFlightSaves`, ...". In the drain-timeout path, `disconnectPlayer` exits with `inFlightSaves > 0`. The final cleanup happens in §6.3 Step 4, which (before this review) only cleared `sessionTokens` and `playerState` — leaving `inFlightSaves = 0` (not nil). T_B's first save (`(0 or 0) + 1 = 1`) and all Phase-2 checks (`(0 or 0) = 0`) work correctly, but the §4 "cleared to nil" guarantee was violated.
+
+**Fix applied:** `inFlightSaves[userId] = nil` added to §6.3 Step 4 (architecture.md); protocol table updated.
+
+---
+
+### Finding M-3: DT-6 had no concrete test for §6.3 Step 4 → Phase-2 signal chain
+
+**Severity:** Medium — test-coverage gap for a critical correctness path
+
+**Location:** `test-results.md` Scenario DT-6
+
+**Finding:** DT-6 only referenced BC-2 and BC-5 without providing a concrete step-by-step trace of the specific §6.3 Step 4 → `inFlightSaves=0` → Phase-2 observer exits → `disconnectCount -= 1` signal chain. This chain is the core correctness claim of D-20 (D-17 fix) and had no self-contained verification.
+
+**Fix applied:** DT-6 replaced with a concrete signal chain test (test-results.md). DT-7 and DT-8 add counter-guard and idempotency tests.
+
+---
+
+### Finding L-1: Risk 8 unaffected by D-20; remains accepted and unresolved
+
+**Severity:** Low — documented limitation, no regression
+
+**Location:** `architecture.md` §15 Risk 8; §7.5
+
+**Finding:** An in-flight `refreshSession` task that completes after `activeLocks[userId]` is cleared can write `_session.since = os.time()` to DataStore, extending the TTL anchor in the abandoned path. D-20's preservation of `sessionTokens` through `disconnectPlayer` step 2 does not affect this risk — the refresh task captured its token before `disconnectPlayer` ran, and `sessionTokens` preservation only changes what the §6.3 Step 2 identity check reads, not what the refresh callback captures or writes. The dual identity check in §7.2 correctly prevents local state corruption, but cannot prevent the DataStore write that already occurred inside the callback.
+
+**D-20 interaction:** Confirmed none. Risk 8 is unchanged by D-20.
+
+**Status:** Accepted. No minimal fix is feasible without reading shared mutable state inside the refresh callback (against §7.1 design constraint) or adding a DataStore write in the drain-timeout path (not feasible when DataStore is unavailable). Worst-case delay is ~20 s beyond expected TTL expiry. See §15 Risk 8 for the updated mitigation note.
+
+**Fix applied:** §15 Risk 8 updated with explicit D-20 interaction analysis (architecture.md). DT-9 added as a concrete Risk 8 scenario (test-results.md).
+
+---
+
+### Additional correctness checks (all passed)
+
+| Scenario | Result |
+|---|---|
+| Step 1 ordering: decrement before identity check | Correct — if Step 2 returned false before Step 1, inFlightSaves would stay > 0 → Phase-2 deadlock. Ordering rationale added to protocol table. |
+| Step 3 + Step 4 ordering: confirmedSessionLoss fall-through then drain-timeout cleanup | Correct — Step 3 "abandoned" path falls through to Step 4; Step 4 fires when counter==0 regardless. |
+| `confirmedSessionLoss` and `saveSucceeded` mutual exclusivity | Correct — the for loop breaks on the first `ok==true` outcome; both cannot be true simultaneously. |
+| §6.3 Step 4 ordering safety (sessionTokens → inFlightSaves → playerState) | Safe — cooperative scheduler ensures the three assignments execute atomically before another coroutine runs. No observable intermediate window. |
+| §6.3 Step 4 second execution blocked | Correct — Step 2 catches it: `sessionTokens==nil ≠ capturedToken` → return false. |
+| Phase-2 exit after Step 4 sets inFlightSaves=nil | Correct — `(nil or 0) = 0 → 0 > 0 is false` → Phase-2 exits. |
+| `disconnectSave` token passed explicitly | Correct — token captured in step 2 (`local token = sessionTokens[userId]`) before sessionTokens is cleared; passed as parameter to disconnectSave and releaseSession. |
+| Cleanup invariant: all tables nil after normal path | Confirmed — step 7 clears all seven tables including sessionTokens (now explicitly preserved until step 7). |
+| Cleanup invariant: drain-timeout path | Confirmed — §6.3 Step 4 now clears sessionTokens, inFlightSaves, playerState; loadedData cleared by disconnectPlayer timeout block; activeLocks cleared in step 2. |
