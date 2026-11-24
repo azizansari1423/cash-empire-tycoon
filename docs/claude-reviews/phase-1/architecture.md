@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-24
 **Scope:** `PlayerDataManager.lua` session locking design
-**Status:** Revision 4 — pending approval before implementation
+**Status:** Revision 5 — pending approval before implementation
 
 ---
 
@@ -72,17 +72,20 @@ Every player has an explicit lifecycle state tracked in `playerState[userId]`. A
           │                    │
           ▼                    ▼
        ["active"]          ["failed"] ──── terminal
-          │  \
-   session loss  releaseSession called
-          │             │
-          ▼             ▼
-  ["invalidated"]  ["releasing"]
-   ─── terminal          │
-                 release UpdateAsync completes
-                 (or all retries exhausted)
-                          │
-                          ▼
-                     ["released"] ──── terminal
+       /      \
+session loss   disconnectPlayer called
+      │              │
+      ▼              ▼
+["invalidated"]  ["disconnecting"]
+ ─── terminal    /           \
+         saves drained      drain deadline exceeded
+         + save + release    (session not released)
+              │                     │
+              ▼                     ▼
+         ["released"]          ["abandoned"]
+          ── terminal           ── terminal
+          (DataStore:           (DataStore: session
+           released=true)        expires by TTL)
 ```
 
 **State definitions:**
@@ -91,21 +94,22 @@ Every player has an explicit lifecycle state tracked in `playerState[userId]`. A
 |---|---|---|
 | nil / "idle" | Player not loaded | loadPlayer |
 | "loading" | loadPlayer in progress | — (concurrent loadPlayer rejected) |
-| "active" | Session held; data valid | getData, addCash, spendCash, savePlayer, releaseSession |
-| "releasing" | Release in progress | savePlayer (in-flight only), releaseSession (no-op) |
-| "released" | Session released | — (all operations blocked) |
+| "active" | Session held; data valid | getData, addCash, spendCash, savePlayer |
+| "disconnecting" | Disconnect lifecycle in progress | savePlayer (in-flight only, via inFlightSaves counter) |
+| "released" | Session explicitly released in DataStore | — (all operations blocked) |
+| "abandoned" | Disconnect deadline exceeded; session expires by TTL | — (all operations blocked) |
 | "failed" | Load failed | — (all operations blocked) |
 | "invalidated" | Session stolen mid-game | — (all operations blocked) |
 
 **Transition rules:**
 
-- `nil → "loading"`: start of `loadPlayer`; rejected if state is "loading" (concurrent) or any non-nil state
+- `nil → "loading"`: start of `loadPlayer`; rejected if state is non-nil
 - `"loading" → "active"`: after confirmed acquisition
 - `"loading" → "failed"`: after all load retries exhausted
-- `"active" → "releasing"`: start of `releaseSession`; first call wins (concurrent second call is a no-op)
-- `"releasing" → "released"`: release UpdateAsync completes or all retries exhausted
+- `"active" → "disconnecting"`: start of `disconnectPlayer`; first caller wins (see §10)
+- `"disconnecting" → "released"`: saves drained, disconnect save committed, release UpdateAsync confirmed
+- `"disconnecting" → "abandoned"`: drain or save deadline exceeded; no release UpdateAsync issued
 - `"active" → "invalidated"`: confirmed session loss in `savePlayer` or `refreshSession`
-- `"releasing" → "invalidated"`: release callback detects another server's token (no-op — still transition to "released" since we can't do anything further)
 
 **Cleanup:** On `PlayerRemoving`, all state tables (`playerState`, `loadedData`, `sessionTokens`, `activeLocks`, `lastRefresh`) are cleared after save and release complete.
 
@@ -451,147 +455,74 @@ end)
 
 ---
 
-## 8. `releaseSession`
+## 8. Session Release — Internal Helper
 
-### 8.1 State transition, in-flight save wait, and token capture
+`releaseSession` is an **internal helper** called only from `disconnectPlayer` (§10), and only after `disconnectPlayer` has confirmed `inFlightSaves[userId] == 0`. It never waits for saves internally; that is `disconnectPlayer`'s responsibility.
 
-`releaseSession` may be called by `PlayerRemoving` or `BindToClose`. Only the first call does work; the second is a no-op via state check.
+### 8.1 Precondition
 
-**Ordering guarantee:** `releaseSession` waits for all in-flight saves to complete before proceeding with its own UpdateAsync. This ensures the final PlayerRemoving save (which runs just before `releaseSession`) is committed to DataStore before the session is released. Without this wait, a save UpdateAsync and the release UpdateAsync could be serialized in DataStore with the release running first, and the save re-opening the released session.
+`releaseSession` is called only when:
+- `playerState[userId] == "disconnecting"` (set by `disconnectPlayer`)
+- `inFlightSaves[userId] == 0` (confirmed by `disconnectPlayer` before calling)
+- `sessionTokens[userId]` has been cleared (set to nil by `disconnectPlayer` to block new saves before the drain wait)
+
+### 8.2 Token capture and callback
 
 ```
 function releaseSession(userId):
-    if playerState[userId] ~= "active":
-        return                                -- already releasing, released, or not active
+    local token = sessionTokens_captured  -- passed in by disconnectPlayer (see §10)
+    -- token is the value that was in sessionTokens[userId] before disconnectPlayer cleared it.
     
-    playerState[userId] = "releasing"        -- transition BEFORE async operations
-    activeLocks[userId] = nil                -- stop refresh loop from touching this player
+    local released = false
+    for attempt = 1 to RELEASE_RETRIES (3):
+        ok, result = pcall(PlayerStore.UpdateAsync, userId, function(current)
+            if current == nil or current._session == nil: return nil
+            if current._session.token ~= token: return nil  -- not our session
+            newRecord = deepCopy(current)
+            newRecord._session.released = true
+            return newRecord
+        end)
+        
+        if ok and result ~= nil and result._session ~= nil
+                and result._session.token == token and result._session.released == true:
+            released = true; break                           -- confirmed release
+        
+        if ok and (result == nil
+                or (result._session ~= nil and result._session.token ~= token)):
+            -- Another server holds this session. It has already been superseded.
+            -- The session is effectively released from our perspective.
+            released = true; break
+        
+        if not ok:
+            warn("release attempt " .. attempt .. "/" .. RELEASE_RETRIES)
+            if attempt < RELEASE_RETRIES: task.wait(SAVE_BACKOFF * attempt)
     
-    -- Block new saves: clearing sessionTokens causes the §6.1 guard to reject them
-    local token = sessionTokens[userId]      -- capture before clearing
-    sessionTokens[userId] = nil
+    if released:
+        playerState[userId] = "released"
+    else:
+        -- All retries failed (pure DataStore errors). Session will expire by TTL.
+        playerState[userId] = "abandoned"
+        warn("Release failed for userId=" .. userId .. ". Session expires in ~" .. LOCK_TTL .. "s.")
     
-    -- Wait for saves that captured the token before the clear above
-    local waitDeadline = os.clock() + 5      -- 5 s deadline for in-flight saves to complete
-    while (inFlightSaves[userId] or 0) > 0 and os.clock() < waitDeadline do
-        task.wait(0.05)
-    end
-    if (inFlightSaves[userId] or 0) > 0 then
-        warn("releaseSession: in-flight saves did not complete within deadline for userId=" .. userId)
-        -- Proceed anyway; the token check in the release callback handles any ordering
-    end
-    
-    -- Proceed with release UpdateAsync (see §8.3)
+    return released
 ```
 
-**Why clearing `sessionTokens` before waiting is safe:** Saves that have already captured `token` as a local variable continue normally — their callbacks do not read `sessionTokens`. Saves that start after the clear see `sessionTokens[userId] == nil` → `token == nil` → guard rejects them immediately. The `inFlightSaves` wait covers the saves already in-flight.
+**TTL safety net:** Whether `released` or `abandoned`, `activeLocks[userId]` was cleared by `disconnectPlayer` before calling this function. No refresh will fire for this player. The session will not be re-acquired by another server until either (a) `released=true` is in DataStore, or (b) LOCK_TTL seconds elapse from the last confirmed refresh.
 
-### 8.2 Callback
+### 8.3 Execution timeline — single in-flight save at disconnect
 
-```
-callback(current):
-    if current == nil or current._session == nil: return nil
-    if current._session.token ~= token: return nil  -- not our session; leave unchanged
-    newRecord = deepCopy(current)
-    newRecord._session.released = true
-    return newRecord
-```
-
-### 8.3 Retry and failure
+This corresponds to the normal-path timeline from `disconnectPlayer` (§10.4, Timeline A).
 
 ```
-local released = false
-for attempt = 1 to RELEASE_RETRIES (3):
-    ok, result = pcall(PlayerStore.UpdateAsync, userId, callback)
-    if ok and result ~= nil and result._session ~= nil and result._session.released == true
-            and result._session.token == token:
-        released = true; break                        -- confirmed release
-    if ok and result == nil:
-        -- Callback returned nil: another server holds the session.
-        -- Our session was not released; it has already been superseded.
-        -- Treat as effectively released from our perspective.
-        released = true; break
-    if ok and result ~= nil and result._session ~= nil and result._session.token ~= token:
-        -- Non-nil result with wrong token: same situation as nil — session superseded.
-        released = true; break
-    if not ok:
-        warn("release attempt " .. attempt .. "/" .. RELEASE_RETRIES)
-        if attempt < RELEASE_RETRIES: task.wait(SAVE_BACKOFF * attempt)
-
-if not released:
-    warn("Release failed for userId=" .. userId .. ". Lock will expire after " .. LOCK_TTL .. "s.")
-
-playerState[userId] = "released"
-```
-
-If all release retries fail: the session will expire after LOCK_TTL seconds (60s) without refresh (since `activeLocks` was cleared in §8.1). This is the TTL safety net. State transitions to "released" regardless.
-
-### 8.4 Execution timelines — save/release coordination
-
-**Timeline A: autosave in-flight when PlayerRemoving fires**
-
-```
-T0  Autosave fires. savePlayer:
-      state=="active" ✓
-      token=T_A, snapshot=deepCopy(loadedData[X]) captured
-      inFlightSaves[X] = 1
-      UpdateAsync yields
-
-T1  PlayerRemoving fires. PlayerRemoving calls savePlayer(X):
-      state=="active" ✓ (save guard)
-      token=T_A, snapshot=deepCopy(loadedData[X]) captured (may differ from T0 snapshot)
-      inFlightSaves[X] = 2
-      UpdateAsync yields
-
-T2  PlayerRemoving calls releaseSession(X):
-      state=="active" → "releasing"
-      sessionTokens[X] = nil (blocks further saves)
-      Wait: inFlightSaves[X] == 2 > 0 → task.wait(0.05) loop
-
-T3  Autosave UpdateAsync completes:
-      result._session.token == T_A → save confirmed ✅
-      inFlightSaves[X] = 1; still > 0
-
-T4  PlayerRemoving save UpdateAsync completes:
-      result._session.token == T_A → save confirmed ✅
-      inFlightSaves[X] = 0 → wait loop exits
-
-T5  releaseSession proceeds: release UpdateAsync fires
-      Callback: current._session.token == T_A → match → released=true
-      result._session.token == T_A, released=true → confirmed ✅
-      state → "released"
-
-Final DataStore state: {PlayerRemoving_snapshot, _session:{T_A, released:true}} ✅
-(PlayerRemoving save ran after autosave; its snapshot is more recent)
-```
-
-**Two overlapping saves with different snapshots — last-DataStore-write-wins:**
-
-If autosave snapshot_T0 and PlayerRemoving snapshot_T1 are both in-flight and DataStore serializes autosave last, snapshot_T0 overwrites snapshot_T1. This is avoided by the `inFlightSaves` wait: `releaseSession` does not proceed to its release UpdateAsync until both saves complete. The PlayerRemoving save is started (by `PlayerDataManager.PlayerRemoving`) before `releaseSession` is called, so the PlayerRemoving save's snapshot is always at least as recent as the autosave's snapshot. After both saves commit, the last DataStore write is whichever UpdateAsync Roblox serialized second — an ordering that cannot be controlled. The difference between the two snapshots is at most one autosave interval (60s) of in-game earnings. This is the remaining unresolved risk (§15 Risk 6).
-
-**Timeline B: concurrent PlayerRemoving and BindToClose releases**
-
-```
-T0  PlayerRemoving: releaseSession → state "active" → "releasing"
-    Wait: inFlightSaves[X] == 0 → no wait needed
-    sessionTokens[X] = nil; token=T_A captured; release UpdateAsync yields
-
-T1  BindToClose: releaseSession → state == "releasing" → no-op; returns immediately ✅
-
-T2  PlayerRemoving release UpdateAsync completes → state → "released" ✅
-No duplicate release written to DataStore ✅
-```
-
-**Timeline C: BindToClose fires before PlayerRemoving completes**
-
-```
-T0  PlayerRemoving: savePlayer(X) starts; inFlightSaves[X]=1; UpdateAsync yields
-T1  BindToClose: savePlayer(X) starts; inFlightSaves[X]=2; UpdateAsync yields
-T2  BindToClose: releaseSession → state=="active"→"releasing"; wait: inFlightSaves[X]==2 > 0 → loops
-T3  PlayerRemoving: releaseSession → state=="releasing" → no-op ✅
-T4  T0 save UpdateAsync completes; inFlightSaves[X]=1
-T5  T1 save UpdateAsync completes; inFlightSaves[X]=0 → wait exits
-T6  BindToClose release UpdateAsync → released=true; state→"released" ✅
+T0  disconnectPlayer starts for X. State="active"→"disconnecting".
+    activeLocks[X]=nil; captured token=T_A; sessionTokens[X]=nil.
+T1  Drain wait: inFlightSaves[X]==0 → no wait (no autosave in flight). Pass.
+T2  Disconnect save: savePlayer(X); snapshot=deepCopy(loadedData[X]); inFlightSaves[X]=1.
+T3  Disconnect save UpdateAsync completes:
+    result._session.token==T_A → confirmed ✅; inFlightSaves[X]=0.
+T4  releaseSession(X, T_A) called.
+    Callback: current._session.token==T_A → released=true; state→"released" ✅
+Final DataStore: {snapshot, _session:{T_A, released:true}} ✅
 ```
 
 ---
@@ -640,64 +571,190 @@ Data integrity: no modifications to stale in-memory profile after T1 ✅
 
 ## 10. Disconnect and Shutdown
 
-### 10.1 `PlayerRemoving`
+All disconnect logic is centralised in `disconnectPlayer`. Both `PlayerRemoving` and `BindToClose` call it. A `shuttingDown[userId]` flag ensures only one caller owns the lifecycle; the other returns immediately without competing saves or releases.
+
+### 10.1 `disconnectPlayer` — unified shutdown lifecycle
+
+The lifecycle enforces a strict sequential order: drain autosaves → disconnect save → release. Each step must complete before the next begins. If any deadline is exceeded, the session is not released in DataStore; it expires by TTL instead, and state transitions to "abandoned".
+
+```
+-- shuttingDown[userId] = nil | true  (guards single ownership)
+-- DRAIN_DEADLINE = 5 s  (time to wait for in-flight autosaves)
+-- SAVE_DEADLINE  = SAVE_RETRIES * (SAVE_BACKOFF * SAVE_RETRIES + 1) + 2  (~12 s, covers all retries)
+
+function disconnectPlayer(userId, player):
+    -- 1. Single-owner guard
+    if shuttingDown[userId]: return                  -- another caller is handling this player
+    if playerState[userId] ~= "active": return       -- not in a state we can disconnect
+    shuttingDown[userId] = true
+    playerState[userId] = "disconnecting"
+    
+    -- 2. Stop refresh and block new saves
+    activeLocks[userId] = nil                        -- refresh loop stops iterating this player
+    local token = sessionTokens[userId]
+    sessionTokens[userId] = nil                      -- §6.1 guard rejects all new saves
+    
+    -- 3. Drain in-flight autosaves
+    --    Any autosave that captured token before step 2 is in flight.
+    --    Wait for it to complete (decrement inFlightSaves) before proceeding.
+    local drainDeadline = os.clock() + DRAIN_DEADLINE
+    while (inFlightSaves[userId] or 0) > 0 and os.clock() < drainDeadline:
+        task.wait(0.05)
+    
+    if (inFlightSaves[userId] or 0) > 0:
+        -- Autosave did not complete within deadline. Cannot guarantee snapshot ordering.
+        -- Do NOT proceed with disconnect save or release.
+        -- Session expires by TTL (activeLocks cleared → no refreshes → TTL countdown).
+        playerState[userId] = "abandoned"
+        warn("disconnectPlayer: autosave drain timeout for userId=" .. userId
+             .. ". Session expires in ~" .. LOCK_TTL .. "s.")
+        -- Cleanup: safe because autosave captured its own snapshot before this point.
+        -- inFlightSaves is NOT cleared here; the autosave owns its counter slot.
+        -- It will decrement inFlightSaves itself when its UpdateAsync completes.
+        loadedData[userId]    = nil
+        invalidated[userId]   = nil
+        lastRefresh[userId]   = nil
+        shuttingDown[userId]  = nil
+        return
+    
+    -- 4. Disconnect save (inFlightSaves[userId] == 0 confirmed above)
+    --    snapshot is taken inside savePlayer; only one save is in flight.
+    savePlayer(player)
+    
+    -- 5. Wait for disconnect save to complete
+    local saveDeadline = os.clock() + SAVE_DEADLINE
+    while (inFlightSaves[userId] or 0) > 0 and os.clock() < saveDeadline:
+        task.wait(0.05)
+    
+    if (inFlightSaves[userId] or 0) > 0:
+        -- Disconnect save did not complete. Session expires by TTL.
+        playerState[userId] = "abandoned"
+        warn("disconnectPlayer: save deadline exceeded for userId=" .. userId
+             .. ". Session expires in ~" .. LOCK_TTL .. "s.")
+        loadedData[userId]    = nil
+        invalidated[userId]   = nil
+        lastRefresh[userId]   = nil
+        inFlightSaves[userId] = nil   -- safe: save UpdateAsync is stuck; we give up on it
+        shuttingDown[userId]  = nil
+        return
+    
+    -- 6. Release session (saves confirmed drained; inFlightSaves[userId] == 0)
+    releaseSession(userId, token)    -- internal helper; see §8
+    
+    -- 7. Cleanup (all async operations complete)
+    loadedData[userId]    = nil
+    invalidated[userId]   = nil
+    lastRefresh[userId]   = nil
+    inFlightSaves[userId] = nil
+    shuttingDown[userId]  = nil
+    -- playerState already set to "released" or "abandoned" by releaseSession / step 5
+```
+
+**Why state tables are only cleared after all async operations complete:**
+
+- Steps 3–5 each confirm `inFlightSaves[userId] == 0` before proceeding. By step 7, no UpdateAsync calls are outstanding.
+- In the drain-timeout path (step 3 failure), `loadedData` is cleared but `inFlightSaves` is NOT — the in-flight autosave still holds a reference and will decrement it. Clearing `inFlightSaves` early would leave the counter at a stale value if the autosave later tries to decrement.
+- In the save-deadline path (step 5 failure), `inFlightSaves` IS cleared: at this point we consider the save stuck and give up on it. It is a degraded path; the session expires by TTL.
+
+### 10.2 `PlayerRemoving`
 
 ```
 Players.PlayerRemoving:Connect(function(player)
     local userId = tostring(player.UserId)
-    -- Save first. This increments inFlightSaves and starts UpdateAsync.
-    savePlayer(player)
-    -- Release next. releaseSession waits for inFlightSaves[userId]==0 before
-    -- proceeding to its own UpdateAsync, so the save always commits before the release.
-    releaseSession(userId)
-    -- Cleanup all state tables (state is "released" or terminal at this point)
-    loadedData[userId]       = nil
-    invalidated[userId]      = nil
-    lastRefresh[userId]      = nil
-    playerState[userId]      = nil
-    inFlightSaves[userId]    = nil
+    disconnectPlayer(userId, player)
 end)
 ```
 
-`releaseSession` waits for `inFlightSaves[userId] == 0` before issuing its own UpdateAsync (§8.1). This guarantees the PlayerRemoving save is committed to DataStore before the session is marked released.
-
-### 10.2 `BindToClose`
+### 10.3 `BindToClose`
 
 ```
 game:BindToClose(function()
-    local savingCount = 0
+    local disconnectCount = 0
     for _, player in ipairs(Players:GetPlayers()) do
-        savingCount += 1
+        disconnectCount += 1
         local userId = tostring(player.UserId)
         task.spawn(function()
-            savePlayer(player)         -- state guard: "active" or "releasing" only
-            releaseSession(userId)     -- second concurrent call is a no-op via state check
-            savingCount -= 1
+            disconnectPlayer(userId, player)
+            disconnectCount -= 1
         end)
     end
     local deadline = os.clock() + 25
-    while savingCount > 0 and os.clock() < deadline do
+    while disconnectCount > 0 and os.clock() < deadline do
         task.wait(0.1)
     end
-    if savingCount > 0 then
-        warn("[DataManager] BindToClose: shutdown deadline with " .. savingCount .. " unsaved player(s)")
+    if disconnectCount > 0 then
+        warn("[DataManager] BindToClose: 25s deadline reached with " .. disconnectCount .. " player(s) pending")
     end
 end)
 ```
 
-### 10.3 Race analysis — PlayerRemoving + BindToClose for the same player
+### 10.4 Execution timelines
 
-This corresponds to Timeline C in §8.4 (BindToClose fires before PlayerRemoving completes). The lifecycle state machine and `inFlightSaves` wait ensure exactly one release is written.
+**Timeline A: PlayerRemoving fires, no autosave in flight**
 
 ```
-T0  PlayerRemoving thread A: savePlayer → inFlightSaves[X]=1; UpdateAsync yields
-T1  BindToClose thread B: savePlayer → inFlightSaves[X]=2; UpdateAsync yields
-T2  Thread B: releaseSession → state "active"→"releasing"; tokenX=T_A; wait: inFlightSaves>0
-T3  Thread A: releaseSession → state=="releasing" → no-op immediately ✅
-T4  Thread A save completes → inFlightSaves[X]=1; still > 0 → Thread B still waiting
-T5  Thread B save completes → inFlightSaves[X]=0 → Thread B wait exits
-T6  Thread B: release UpdateAsync → token match → released=true → state→"released" ✅
-Result: two saves committed; one release written; state = "released" ✅
+T0  PlayerRemoving calls disconnectPlayer(X).
+    shuttingDown[X]=true; state→"disconnecting"; activeLocks[X]=nil; token=T_A; sessionTokens[X]=nil.
+T1  Drain: inFlightSaves[X]==0 → pass immediately.
+T2  savePlayer(X): snapshot captured; inFlightSaves[X]=1; UpdateAsync yields.
+T3  Disconnect save completes → inFlightSaves[X]=0.
+T4  releaseSession(X, T_A): token match → released=true → state→"released" ✅
+T5  Cleanup: loadedData[X]=nil; inFlightSaves[X]=nil; shuttingDown[X]=nil.
+```
+
+**Timeline B: Autosave in flight when PlayerRemoving fires**
+
+```
+T0  Autosave: savePlayer(X); snapshot_T0 captured; inFlightSaves[X]=1; UpdateAsync yields.
+T1  PlayerRemoving: disconnectPlayer(X).
+    shuttingDown[X]=true; state→"disconnecting"; token=T_A; sessionTokens[X]=nil.
+T2  Drain: inFlightSaves[X]==1 > 0 → wait(0.05) loop.
+T3  Autosave UpdateAsync completes; inFlightSaves[X]=0 → drain passes.
+    (DataStore now has the autosave snapshot_T0.)
+T4  savePlayer(X): snapshot_T1=deepCopy(loadedData[X]) captured (all mutations up to T4);
+    inFlightSaves[X]=1; UpdateAsync yields.
+T5  Disconnect save UpdateAsync completes; inFlightSaves[X]=0.
+    DataStore: {snapshot_T1, _session:{T_A}} (snapshot_T1 ≥ snapshot_T0 by time ordering).
+T6  releaseSession(X, T_A): released=true; state→"released" ✅.
+T7  Cleanup.
+```
+
+No two saves are in flight simultaneously. The disconnect save always starts after any prior autosave completes. snapshot_T1 captures all data written between T0 (autosave capture) and T4 (disconnect capture). The final DataStore state is snapshot_T1, which is the most recent snapshot. ✅
+
+**Timeline C: PlayerRemoving fires before BindToClose reaches same player**
+
+```
+T0  PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle runs.
+T1  BindToClose iterates Players. If player X is in the list:
+    disconnectPlayer(X) → shuttingDown[X]==true → returns immediately ✅
+PlayerRemoving's lifecycle handles everything; BindToClose is a no-op for this player.
+```
+
+**Timeline D: BindToClose fires before PlayerRemoving has started disconnectPlayer**
+
+```
+T0  BindToClose: task.spawn → disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle starts.
+T1  PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]==true → returns immediately ✅
+BindToClose's lifecycle handles everything for this player.
+```
+
+**Timeline E: Autosave drain timeout — TTL path**
+
+```
+T0  Autosave: savePlayer(X); inFlightSaves[X]=1; UpdateAsync stalled (DataStore unavailable).
+T1  PlayerRemoving: disconnectPlayer(X).
+    state→"disconnecting"; sessionTokens[X]=nil.
+T2  Drain: inFlightSaves[X]==1 > 0; wait loop.
+T3  After DRAIN_DEADLINE (5s): inFlightSaves[X] still 1 → drain timeout.
+    state→"abandoned"; loadedData[X]=nil; return.
+    (inFlightSaves[X] NOT cleared; autosave owns its slot.)
+T4  Autosave eventually completes (DataStore available again):
+    inFlightSaves[X] decremented → 0.
+    Save callback: current._session.token==T_A → data written.
+    (Session not released; another server waits for TTL.)
+T5  LOCK_TTL expires (60s from last refresh, since activeLocks cleared at T1).
+    Session available to other servers. ✅
+Data integrity: autosave snapshot written (T4); no release race. ✅
 ```
 
 ---
@@ -709,7 +766,8 @@ Result: two saves committed; one release written; state = "released" ✅
 | `loadPlayer` | Retry 3×, 2s/4s backoff; kick after all fail | Kick immediately; no retry | Build data from returned record |
 | `savePlayer` | Retry 3×, 2s/4s backoff | `invalidated[userId]=true`; kick; no retry | Return true |
 | `refreshSession` | Log; check elapsed vs LOCK_TTL | `invalidated[userId]=true`; kick | Update `lastRefresh` |
-| `releaseSession` | Retry 3×; state → "released" regardless | No-op (not our session) | State → "released" |
+| `disconnectPlayer` | TTL path if drain/save deadline exceeded; state → "abandoned" | (n/a — called on normal disconnect, not on session loss) | State → "released" |
+| `releaseSession` | Retry 3×; state → "abandoned" on all DataStore errors exhausted | Token mismatch → state → "released" (session superseded) | State → "released" |
 
 **Never treat unknown load result as new player:** A load succeeds only when `result._session.token == token`. All other outcomes (error, nil, different token) transition to "failed" / trigger a kick without populating `loadedData`.
 
@@ -753,15 +811,18 @@ Result: two saves committed; one release written; state = "released" ✅
 | `playerState = {}` | Add (lifecycle state machine) |
 | `sessionTokens = {}` | Add |
 | `lastRefresh = {}` | Add |
-| `inFlightSaves = {}` | Add (tracks count of active UpdateAsync save calls per player; `releaseSession` waits for this to reach 0) |
+| `inFlightSaves = {}` | Add (counts active UpdateAsync save calls per player; `disconnectPlayer` waits for 0 before saving/releasing) |
+| `shuttingDown = {}` | Add (single-ownership flag for disconnect lifecycle; prevents competing saves/releases from PlayerRemoving and BindToClose) |
 | `acquireLock()` | Remove — merged into `loadPlayer` callback |
-| `releaseLock()` | Remove — replaced by `releaseSession()` (§8) |
+| `releaseLock()` | Remove — replaced by internal `releaseSession()` (§8) |
 | `refreshLock()` | Remove — replaced by `refreshSession()` (§7) |
 | `loadPlayer()` | Rewrite per §5; concurrent load guard; GUID token; result-verification only |
-| `savePlayer()` | Rewrite per §6; token captured before async; `confirmedSessionLoss` set outside callback |
+| `savePlayer()` | Rewrite per §6; token+snapshot captured before async; `confirmedSessionLoss` outside callback |
+| `releaseSession()` | Rewrite as internal helper called only from `disconnectPlayer` after saves confirmed drained |
+| `disconnectPlayer()` | Add (new; handles full drain→save→release lifecycle; called by both PlayerRemoving and BindToClose) |
 | `getData()` | Update per §9.2; check `invalidated` and `playerState` |
-| `PlayerRemoving` handler | Update per §10.1 |
-| `BindToClose` handler | Update per §10.2 |
+| `PlayerRemoving` handler | Update per §10.2 — calls only `disconnectPlayer` |
+| `BindToClose` handler | Update per §10.3 — calls only `disconnectPlayer` per player |
 | `addCash`, `spendCash` | No change — both call `getData`; automatically guarded |
 
 ### `TycoonManager.server.lua`, `MapBuilder.server.lua` — no changes
@@ -805,16 +866,24 @@ Roblox does not guarantee that `PlayerRemoving` fires before `BindToClose`. The 
 
 `loadedData[userId]` never contains `_session`. However, if any code path accidentally writes a `_session` key into `loadedData`, the save callback's `deepCopy(snapshot)` would include it, then `newRecord._session = current._session` would overwrite it — the DataStore write would still be correct. This is a defence-in-depth property; the primary protection is that `loadPlayer` strips `_session` before populating `loadedData`.
 
-**Risk 6 — Overlapping save snapshots (last-DataStore-write-wins within one session)**
+**Risk 6 — Overlapping save snapshots (resolved in Revision 5 for normal path)**
 
-If autosave and PlayerRemoving save are both in-flight simultaneously, they carry different snapshots (snapshot_T0 and snapshot_T1 respectively, where T1 > T0). `releaseSession` waits for both saves to complete (§8.1) before releasing, ensuring neither save races with the release. However, DataStore serializes the two save UpdateAsync calls in an order that cannot be controlled: if autosave runs last in DataStore, it overwrites snapshot_T1 with snapshot_T0 (data from before the most recent `addCash` calls). The difference is at most one autosave interval (60s) of in-game earnings. Mitigation: the PlayerRemoving path could skip the autosave if one is already in-flight, using a debounce. This is deferred to implementation review.
+Revision 4 did not prevent two saves from being in flight simultaneously at disconnect time, creating a last-DataStore-write-wins race between different snapshots.
+
+Revision 5 `disconnectPlayer` drains all in-flight autosaves (§10, step 3) before taking the disconnect snapshot (step 4). There is never more than one save in flight at any point in the disconnect lifecycle. The disconnect save's snapshot is always at least as recent as the last autosave's snapshot. The race condition is eliminated for the normal path.
+
+**Remaining edge case:** In the drain-timeout TTL path (Timeline E), the autosave is still in-flight when `disconnectPlayer` exits. The autosave may write its snapshot to DataStore after the disconnect. Since no release is issued and no competing disconnect save exists, there is no ordering conflict — the autosave's write is the final write. Session availability for other servers is delayed by TTL.
+
+**Risk 7 — `disconnectPlayer` drain/save deadline may be too short for DataStore latency spikes**
+
+The 5-second drain deadline and ~12-second save deadline are estimates based on SAVE_RETRIES and SAVE_BACKOFF constants. In severe DataStore outages, these may be insufficient. The result is the TTL path (§10.1 steps 3–5), which is safe but delays rejoin by up to LOCK_TTL (60s). Deadline values should be tuned against observed DataStore latency in production. Requires runtime verification.
 
 ---
 
 ## 16. Assumptions Requiring Verification
 
 1. `PlayerStore:UpdateAsync` returns the value written by the callback (not the pre-write value) when the callback returns non-nil.
-2. When the callback returns nil, `UpdateAsync` returns nil (not the existing value). If it returns the existing value, the result-token check still correctly detects session loss (`result._session.token ~= token`), so both behaviours are covered.
+2. **UNVERIFIED:** When the callback returns nil, `UpdateAsync` behaviour is not confirmed. See §15 Risk 1. Both possible return values (nil, or the existing record) are handled without false success by the token-match check.
 3. `HttpService:GenerateGUID(false)` is available without restriction in production Roblox servers (not just Studio with HTTP enabled).
 4. Roblox's cooperative scheduler ensures that a table assignment (`sessionTokens[userId] = nil`) is visible to all coroutines that read that table after the next yield point, with no partially-visible intermediate state.
 5. `Players:GetPlayers()` during `BindToClose` execution does not include players whose `PlayerRemoving` has completed (player object removed from service). If it does include recently-removed players, the `loadedData[userId] == nil` guard safely rejects the save.

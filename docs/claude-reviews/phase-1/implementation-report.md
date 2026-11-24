@@ -3,7 +3,7 @@
 **Date:** 2026-11-24
 **Branch:** `feature/phase-1-data-foundation` (commit b05aa20)
 **Review branch:** `claude-review/phase-1`
-**Status:** Revision 4 — pending approval before implementation
+**Status:** Revision 5 — pending approval before implementation
 
 ---
 
@@ -126,7 +126,11 @@ There is no formal state machine governing player data lifecycle. This creates s
 | R13 | `savePlayer` deep-copies `loadedData[userId]` into a local `snapshot` before the `UpdateAsync` call. The callback uses only `snapshot` and the captured `token` — both are immutable from that point forward. The callback does not read `loadedData`, `sessionTokens`, or any other shared mutable table. | D-6 | §6.1, §6.2 |
 | R14 | The acquisition callback uses a single TTL-based availability rule: a session is available if absent, released, or `(now - sess.since) >= LOCK_TTL`. A live session is blocked if and only if `sess.token ~= token`. The job ID is not independently evaluated for blocking. | D-7 | §5.3 |
 | R15 | `refreshSession` treats any non-error `UpdateAsync` result where `result._session.token ~= sessionTokens[userId]` as confirmed ownership loss, including both `result == nil` and a non-nil result with a different token. Only `result._session.token == sessionTokens[userId]` constitutes a confirmed refresh. | D-8 | §7.2 |
-| R16 | `inFlightSaves[userId]` tracks the count of active `savePlayer` UpdateAsync calls. It is incremented before each UpdateAsync and decremented unconditionally after. `releaseSession` waits for `inFlightSaves[userId] == 0` (up to 5 seconds) before proceeding to its release UpdateAsync. | D-9 | §8.1 |
+| R16 | `inFlightSaves[userId]` tracks the count of active `savePlayer` UpdateAsync calls. It is incremented before each UpdateAsync and decremented unconditionally after. `disconnectPlayer` confirms `inFlightSaves[userId] == 0` before starting the disconnect save and before calling `releaseSession`. | D-9, D-11 | §8.1, §10.1 |
+| R17 | `releaseSession` is called only from `disconnectPlayer` after `inFlightSaves[userId] == 0` is confirmed. If the drain or save deadline is exceeded, `releaseSession` is not called. State transitions to "abandoned" and the session expires by TTL. Release is never attempted while saves remain in flight. | D-10 | §8, §10.1 |
+| R18 | `disconnectPlayer(userId, player)` is the single entry point for all disconnect logic. A `shuttingDown[userId]` flag ensures only one caller (PlayerRemoving or BindToClose) owns the drain→save→release lifecycle. The second caller returns immediately without starting any saves or releases. | D-12 | §10 |
+| R19 | State table cleanup (`loadedData`, `invalidated`, `lastRefresh`, `inFlightSaves`, `shuttingDown`) is performed only after all async operations have completed. `inFlightSaves[userId]` is not cleared while an in-flight autosave is still running (drain-timeout path). | D-11 | §10.1 |
+| R20 | `UpdateAsync` return value when callback returns nil is not confirmed. No code path or test asserts either return behaviour as fact. Both `result == nil` and `result._session.token ~= token` are treated as ownership loss across all four operations (acquire, save, refresh, release). | Revision 5 | §15 Risk 1 |
 
 ---
 
@@ -193,6 +197,52 @@ Additionally, two concurrent saves with different snapshots (autosave + PlayerRe
 | Issue 3 — mutation after ownership loss | `loadFailed` did not block `getData`; `addCash`/`spendCash` could mutate stale data | `invalidated[userId]` checked in `getData`; covers load failure AND mid-game session loss |
 | Issue 4 — save/release coordination | No formal lifecycle; `sessionTokens` clear did not prevent concurrent release calls | `playerState[userId]` state machine; "releasing" state blocks duplicate releases; in-flight saves use captured token |
 
+## Defects Found in Revision 4 Architecture (4ec3797)
+
+### D-10: Release proceeded after drain timeout, violating ordering guarantee (CRITICAL)
+
+**File:** `PlayerDataManager.lua` (design)
+
+Revision 4 §8.1 warned when `inFlightSaves > 0` after the 5-second deadline but then proceeded with the release UpdateAsync anyway. The stated ordering guarantee was "saves must commit before release." Proceeding with release while a save was still in-flight violated that guarantee: the release UpdateAsync could be serialised in DataStore before the late save, and the late save's callback would then run after `released=true` was written.
+
+**Actual risk of late save with Revision 4's callback:** The save callback does `newRecord._session = current._session`, copying `current._session` from DataStore. If the release had already committed `released=true`, the late save's callback would see `current._session.released=true` and copy it into the new record. So `released=true` would be preserved. The actual risk was not session re-opening but stale snapshot overwriting newer data, and the session being unavailable to other servers until the late save committed (since another server's acquisition callback would see `released=false` from the stale current record until the late save ran).
+
+**Fix:** When the drain deadline is exceeded, do NOT proceed with the release UpdateAsync. Set state to "abandoned". The session expires by TTL (activeLocks cleared → no refreshes → LOCK_TTL countdown). See architecture §10.1 (Revision 5).
+
+---
+
+### D-11: Cleanup cleared `inFlightSaves[userId]` while save was still in flight (HIGH)
+
+**File:** `PlayerDataManager.lua` (design)
+
+Revision 4 `PlayerRemoving` unconditionally cleared `inFlightSaves[userId] = nil` at the end of cleanup, even in the drain-timeout path where an autosave was still in flight. The in-flight autosave would later try to decrement `inFlightSaves[userId]` — which was now nil — resulting in a nil arithmetic error.
+
+**Fix:** In the drain-timeout TTL path, do NOT clear `inFlightSaves[userId]`. The in-flight autosave owns its counter slot and decrements it itself when its UpdateAsync completes. Only clear `inFlightSaves[userId]` after confirming it is 0 (normal path) or after deliberately giving up on a stuck save (save-deadline path with explicit warning). See architecture §10.1 (Revision 5).
+
+---
+
+### D-12: Both PlayerRemoving and BindToClose could start competing saves (HIGH)
+
+**File:** `PlayerDataManager.lua` (design)
+
+Revision 4 had both `PlayerRemoving` and `BindToClose` independently calling `savePlayer` and `releaseSession`. There was no mechanism to prevent both from starting saves before either called `releaseSession`. The `inFlightSaves` counter would reach 2, and `releaseSession` (called from whichever thread first acquired the "releasing" state) would wait for both — but the two snapshots could differ, and the last-DataStore-write-wins would not necessarily be the more recent snapshot.
+
+**Fix:** Introduce `disconnectPlayer(userId, player)` with a `shuttingDown[userId]` single-ownership guard. The first caller (PlayerRemoving or BindToClose) owns the entire lifecycle (drain → save → release). The second caller returns immediately. Only one save is ever started per disconnect. See architecture §10 (Revision 5).
+
+---
+
+### D-13: IW-1 test scenario incorrectly described late-save risk (DOCUMENTATION)
+
+**File:** `test-results.md` (Revision 4)
+
+Scenario IW-1 stated that a late save would "re-write `released=false`", which is incorrect. The Revision 4 save callback copies `current._session` from DataStore, not from memory. If the DataStore record already has `released=true`, the late save's callback would copy that field and the written record would also have `released=true`. The session would not be re-opened.
+
+The actual risks of allowing a late save were: (a) stale snapshot overwrites newer data written to DataStore by the release, (b) another server's acquisition callback sees a non-released record from the stale `current` passed to the late save callback before it commits, potentially delaying that server's acquisition.
+
+**Fix:** Correct the IW-1 scenario to describe the accurate risk. See test-results.md (Revision 5).
+
+---
+
 ## Summary of Changes from Revision 3 (7aa733d)
 
 | Issue | Revision 3 problem | Revision 4 fix |
@@ -200,4 +250,13 @@ Additionally, two concurrent saves with different snapshots (autosave + PlayerRe
 | D-6 — save callback reads shared state | Callback read `loadedData[userId]` during UpdateAsync; could see nil on retry after releaseSession clears it | `snapshot = deepCopy(loadedData[userId])` captured before UpdateAsync; callback uses only snapshot + token |
 | D-7 — acquisition contradiction | Same-jobId rejection was unconditional; contradicted test DS-3 for expired sessions | Single TTL rule: session available if expired or released; live sessions blocked only by token mismatch |
 | D-8 — refresh non-nil wrong-token | Only checked `result == nil` for ownership loss; missed non-nil result with wrong token | All `ok==true` outcomes where `result._session.token ~= sessionTokens[userId]` treated as ownership loss |
-| D-9 — no in-flight save wait | `releaseSession` did not wait for in-flight saves; release could be serialized before save in DataStore | `inFlightSaves[userId]` counter; `releaseSession` waits for counter to reach 0 before releasing |
+| D-9 — no in-flight save wait | `releaseSession` did not wait for in-flight saves; release could be serialized before save in DataStore | `inFlightSaves[userId]` counter; `disconnectPlayer` confirms counter is 0 before saving and before releasing |
+
+## Summary of Changes from Revision 4 (4ec3797)
+
+| Issue | Revision 4 problem | Revision 5 fix |
+|---|---|---|
+| D-10 — release after drain timeout | `releaseSession` proceeded even when drain deadline exceeded; violated ordering guarantee | TTL path: if deadline exceeded, do NOT call `releaseSession`; state→"abandoned"; session expires by TTL |
+| D-11 — cleanup cleared in-flight counter | `inFlightSaves[userId]=nil` cleared unconditionally in cleanup, even with in-flight autosave | Only clear `inFlightSaves` after confirmed 0 (normal path) or after deliberate give-up (save-deadline path) |
+| D-12 — competing saves from both callers | Both PlayerRemoving and BindToClose could independently call `savePlayer`, creating overlapping saves | `disconnectPlayer` with `shuttingDown[userId]` single-owner guard; second caller is a no-op |
+| D-13 — IW-1 inaccurate risk description | Claimed late save would write `released=false`; callback actually copies `current._session` preserving `released=true` | Corrected IW-1 to describe actual risks: stale snapshot, delayed acquisition by other servers |

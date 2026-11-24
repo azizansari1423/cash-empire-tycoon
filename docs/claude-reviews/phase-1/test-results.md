@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-24
 **Commit under review:** b05aa20 (`feature/phase-1-data-foundation`)
-**Review revision:** 4
+**Review revision:** 5
 **Status:** Test plan revised — runtime tests not yet executed
 
 > **Note:** All test results in this document are design-level analysis. No runtime tests have been executed. Test scenarios marked PASS/FAIL reflect whether the revised design is expected to handle them correctly, not observed runtime behaviour.
@@ -224,60 +224,136 @@ Expected: Same outcome regardless of nil vs non-nil behaviour. DESIGN: PASS
 
 ### In-Flight Save Wait (NEW — Revision 4, D-9)
 
-**Scenario IW-1: releaseSession would have committed before in-flight save (Revision 3 defect)**
+**Scenario IW-1: Revision 4 drain-timeout proceeded with release — accurate risk description**
+
+(This corrects the IW-1 scenario from Revision 4, which incorrectly claimed the late save would re-write `released=false`.)
 
 ```
-Broken (Revision 3):
-Step 1:   PlayerRemoving save starts → UpdateAsync yields (inFlightSaves not tracked)
-Step 2:   releaseSession: sessionTokens=nil; immediately starts release UpdateAsync
-Step 3:   DataStore serializes: release UpdateAsync runs first
-          → {data, _session:{T_A, released:true}} written
-Step 4:   Save UpdateAsync callback: current._session.released == true (from step 3)
-          But Revision 3 save callback only checks token, not released flag.
-          → callback writes {new_data, _session:{T_A, released:false}} ← re-opens released session
-Step 5:   Another server can now acquire T_A's session (released=false, T_A not expired)
-          → DATA INTEGRITY VIOLATION ← WRONG
+Revision 4 actual behaviour when drain timeout is exceeded and release proceeds:
+Step 1:   Autosave in-flight (inFlightSaves[X]=1). Drain deadline exceeded.
+Step 2:   releaseSession proceeds: release UpdateAsync → {data_at_release, _session:{T_A, released:true}}.
+Step 3:   Autosave eventually completes. Callback receives current = {data_at_release, _session:{T_A, released:true}}.
+          current._session.token == T_A → match.
+          newRecord = deepCopy(autosave_snapshot); newRecord._session = current._session.
+          → newRecord._session.released = true  (copied from current, NOT overwritten to false)
+          → writes {autosave_snapshot, _session:{T_A, released:true}}
 
-Fixed (Revision 4):
-Step 2:   releaseSession: sessionTokens=nil; inFlightSaves[X]==1 > 0 → wait loop
-Step 3:   Save UpdateAsync completes → inFlightSaves[X]=0 → wait exits
-Step 4:   Release UpdateAsync runs AFTER save → {saved_data, _session:{T_A, released:true}} ✅
-No re-opening of session possible. DESIGN: PASS
+Actual risks in Revision 4:
+- released=true IS preserved: the late save does NOT re-open the session. ✓
+- Stale snapshot: autosave_snapshot may be older than data_at_release, overwriting newer values.
+- Delayed acquisition by other servers: while autosave is running, any server calling
+  loadPlayer sees `current._session.token == T_A`, released=true (from step 2). It treats
+  the session as released and acquires normally. But then autosave commits step 3, overwriting
+  with autosave_snapshot. The other server's subsequent saves start from autosave_snapshot
+  (the stale data). This is data loss, not a session-opening violation.
+
+Revision 5 fix: When drain deadline exceeded, do NOT proceed with release (TTL path).
+Autosave eventually commits its snapshot. No other server can acquire until TTL expires.
+No stale snapshot race; no data written after release. DESIGN: PASS (Revision 5)
 ```
 
-**Scenario IW-2: inFlightSaves deadline exceeded**
+**Scenario IW-2: disconnectPlayer — drain deadline exceeded (TTL path)**
 
 ```
-Setup:    inFlightSaves[X] = 1 (save UpdateAsync stuck — DataStore unavailable).
-Step 1:   releaseSession: waits 5 seconds; deadline exceeded; inFlightSaves[X] still 1.
-Step 2:   warn("in-flight saves did not complete within deadline").
-Step 3:   releaseSession proceeds anyway with release UpdateAsync.
-Step 4:   The in-flight save eventually completes (or errors). Its callback:
-          If session not yet re-acquired by another server: token match → writes data.
-          Then release UpdateAsync eventually commits (or already committed): session released.
-          If session re-acquired by another server before save completes:
-          Save callback: token mismatch → returns nil → no write ✅
-Step 5:   On deadline miss, the last-committed state may not include the in-flight save's data.
-          Max data loss: one save interval (60s earnings).
-Expected: Deadline miss is a degraded path, not a correctness violation. Session either
-          released (if save completed first) or re-acquirable after TTL. DESIGN: PASS
+Setup:    Autosave in flight (inFlightSaves[X]=1). DataStore stalled.
+Step 1:   disconnectPlayer: drain wait; DRAIN_DEADLINE (5s) exceeded; inFlightSaves[X] still 1.
+Step 2:   state→"abandoned"; activeLocks[X]=nil (already set); sessionTokens[X]=nil (already set).
+          loadedData[X]=nil; lastRefresh[X]=nil; shuttingDown[X]=nil.
+          inFlightSaves[X] NOT cleared (autosave owns its slot).
+Step 3:   disconnectPlayer returns. No disconnect save. No release UpdateAsync.
+Step 4:   Autosave eventually completes: inFlightSaves[X] decremented → 0.
+          Callback: T_A matches DataStore → data written ✅
+Step 5:   No refresh fires (activeLocks cleared at step 1). After LOCK_TTL seconds
+          from last refresh, session expires. Another server acquires normally.
+Expected: Session expires by TTL. Autosave snapshot preserved. No cleanup race. DESIGN: PASS
 ```
 
-### Save/Release Concurrency (NEW — Issue 4)
-
-**Scenario SR-1: Autosave in-flight when PlayerRemoving fires (updated for Revision 4)**
+**Scenario IW-3: disconnectPlayer — save deadline exceeded (TTL path)**
 
 ```
-Setup:    Autosave thread for X: state=="active" ✓; token=T_A, snapshot captured; inFlightSaves[X]=1; UpdateAsync yields.
-          PlayerRemoving fires.
-Step 1:   PlayerRemoving calls savePlayer(X): token=T_A, snapshot captured; inFlightSaves[X]=2; UpdateAsync yields.
-Step 2:   PlayerRemoving calls releaseSession(X): state→"releasing"; sessionTokens[X]=nil.
-          Wait: inFlightSaves[X]==2 > 0 → loops (task.wait(0.05)).
-Step 3:   Autosave UpdateAsync completes; inFlightSaves[X]=1; still > 0 → wait continues.
-Step 4:   PlayerRemoving save UpdateAsync completes; inFlightSaves[X]=0 → wait exits.
-Step 5:   Release UpdateAsync fires: current._session.token==T_A → released=true. PASS
-Step 6:   State → "released". loadedData[X]=nil (cleanup).
-Expected: Both saves committed before release. Session released exactly once. DESIGN: PASS
+Setup:    Drain passes (inFlightSaves[X]=0). disconnectPlayer starts disconnect save.
+          savePlayer(X): inFlightSaves[X]=1; UpdateAsync stalls.
+Step 1:   SAVE_DEADLINE (~12s) exceeded; inFlightSaves[X] still 1.
+Step 2:   state→"abandoned"; inFlightSaves[X]=nil (deliberate give-up — warning issued).
+          loadedData[X]=nil; shuttingDown[X]=nil. No release UpdateAsync.
+Step 3:   Stuck UpdateAsync eventually resolves (or DataStore rejects it).
+          Callback: inFlightSaves decrement now operates on nil → potential nil error.
+          This is the acknowledged risk of the give-up path.
+Step 4:   Session expires by TTL.
+Expected: Degraded path; potential nil-decrement after give-up. Requires implementation
+          care (e.g., nil-safe decrement: inFlightSaves[X] = math.max(0, (inFlightSaves[X] or 1)-1)).
+DESIGN: PASS with implementation note (nil-safe decrement required).
+```
+
+### Single-Owner Disconnect and Save Serialization (NEW — Revision 5, D-12)
+
+**Scenario SO-1: PlayerRemoving fires first; BindToClose observes ownership**
+
+```
+Setup:    Server shutdown: PlayerRemoving fires for Player X.
+Step 1:   PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle starts.
+Step 2:   BindToClose fires. Iterates Players; Player X is in list.
+          disconnectPlayer(X) → shuttingDown[X]==true → return immediately ✅
+Step 3:   PlayerRemoving lifecycle: drain→save→release completes.
+Expected: Exactly one save, one release. No competing saves. DESIGN: PASS
+```
+
+**Scenario SO-2: BindToClose fires first; PlayerRemoving observes ownership**
+
+```
+Setup:    BindToClose fires before PlayerRemoving has called disconnectPlayer.
+Step 1:   BindToClose: task.spawn → disconnectPlayer(X) → shuttingDown[X]=true; full lifecycle.
+Step 2:   PlayerRemoving fires.
+          disconnectPlayer(X) → shuttingDown[X]==true → return immediately ✅
+Step 3:   BindToClose lifecycle: drain→save→release completes.
+Expected: Exactly one save, one release. No competing saves. DESIGN: PASS
+```
+
+**Scenario SO-3: PlayerRemoving fires first but BindToClose reached the spawn point before shuttingDown was set**
+
+```
+Setup:    Race: BindToClose task.spawn fires at the exact moment PlayerRemoving starts disconnectPlayer.
+          Roblox cooperative scheduler: only one coroutine runs at a time between yields.
+Step 1:   PlayerRemoving (runs first): disconnectPlayer(X) → sets shuttingDown[X]=true; yields at drain wait.
+Step 2:   BindToClose spawn resumes: disconnectPlayer(X) → shuttingDown[X]==true → return immediately ✅
+          (Cooperative scheduler means shuttingDown is set before any yield, so no actual race.)
+Expected: shuttingDown assignment is atomic at coroutine boundaries. No race. DESIGN: PASS
+```
+
+**Scenario SO-4: Serialised saves — autosave drains before disconnect save (Revision 5)**
+
+```
+Setup:    Autosave captures snapshot_T0={Cash:100}. addCash(50) runs: loadedData[X].Cash=150.
+          Autosave UpdateAsync yields. PlayerRemoving fires.
+Step 1:   disconnectPlayer(X): drain wait; inFlightSaves[X]==1 > 0 → loops.
+Step 2:   Autosave UpdateAsync completes; inFlightSaves[X]=0.
+          DataStore: {Cash:100, _session:{T_A}}.
+Step 3:   Drain passes. disconnectPlayer takes disconnect snapshot_T1=deepCopy(loadedData[X])={Cash:150}.
+Step 4:   savePlayer(X) starts; inFlightSaves[X]=1; UpdateAsync with snapshot_T1.
+Step 5:   Disconnect save completes: DataStore={Cash:150, _session:{T_A}} ✅
+          inFlightSaves[X]=0.
+Step 6:   releaseSession → released=true. DataStore={Cash:150, _session:{T_A, released:true}} ✅
+Expected: Final DataStore value is snapshot_T1={Cash:150}, the more recent snapshot.
+          No two saves ever in-flight simultaneously. DESIGN: PASS
+
+Contrast with Revision 4 (D-12):
+Step 1:   PlayerRemoving savePlayer + BindToClose savePlayer both start; inFlightSaves[X]=2.
+Step 3:   DataStore serializes: autosave (Cash:100) runs last → overwrites disconnect (Cash:150).
+          Final DataStore: {Cash:100} ← DATA STALE (Revision 4 unfixed)
+```
+
+### Save/Release Concurrency (now handled by disconnectPlayer)
+
+**Scenario SR-1: Autosave in-flight when PlayerRemoving fires (updated for Revision 5)**
+
+```
+Setup:    Autosave in flight (inFlightSaves[X]=1; snapshot_T0 captured). PlayerRemoving fires.
+Step 1:   disconnectPlayer(X): shuttingDown[X]=true; sessionTokens[X]=nil; drain wait.
+Step 2:   Autosave completes; inFlightSaves[X]=0 → drain passes.
+Step 3:   Disconnect save: snapshot_T1 captured (most recent); inFlightSaves[X]=1; UpdateAsync.
+Step 4:   Disconnect save completes; inFlightSaves[X]=0.
+Step 5:   releaseSession → released=true ✅.
+Expected: One save at a time. Final state = snapshot_T1 ≥ snapshot_T0. DESIGN: PASS
 ```
 
 **Scenario SR-2: New save attempt after `sessionTokens` cleared**
@@ -458,6 +534,20 @@ The following tests must be executed in Roblox Studio after implementation. None
 | T-18 | TTL-expired same-server session | Studio: same JobId; write old session with `since` > 60s ago | New load acquires session | Kicked as "active on another server" |
 
 ---
+
+## Tests Added for Revision 5 (Architecture Issues D-10 through D-13)
+
+| Test | Issue covered | Scenario reference |
+|---|---|---|
+| Drain timeout: release NOT issued; session expires by TTL | D-10 — release after drain timeout | IW-2 |
+| Save deadline exceeded: state→abandoned; inFlightSaves not cleared (drain path) | D-11 — cleanup race | IW-2 |
+| Save deadline exceeded: state→abandoned; inFlightSaves deliberately cleared (save-stuck path) | D-11 | IW-3 |
+| PlayerRemoving fires first; BindToClose observes shuttingDown | D-12 — single-owner disconnect | SO-1 |
+| BindToClose fires first; PlayerRemoving observes shuttingDown | D-12 | SO-2 |
+| Cooperative-scheduler guarantee prevents shuttingDown race | D-12 | SO-3 |
+| Serialised saves — autosave drains before disconnect save; disconnect snapshot is freshest | D-12, overlapping saves | SO-4 |
+| SR-1 updated: single save in flight; disconnect snapshot ≥ autosave snapshot | D-12 | SR-1 (Revision 5) |
+| IW-1 corrected: late save preserves released=true; actual risk is stale snapshot | D-13 — IW-1 inaccuracy | IW-1 (corrected) |
 
 ## Tests Added for Revision 4 (Architecture Issues D-6 through D-9)
 
