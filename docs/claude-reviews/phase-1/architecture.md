@@ -1,8 +1,8 @@
-# Phase 1 Architecture — Cash Empire Tycoon (Revision 11)
+# Phase 1 Architecture — Cash Empire Tycoon (Revision 12)
 
 **Date:** 2026-11-25
 **Scope:** `PlayerDataManager.lua` session locking design
-**Status:** Revision 11 — pending approval before implementation
+**Status:** Revision 12 — pending approval before implementation
 
 ---
 
@@ -110,9 +110,13 @@ session loss   disconnectPlayer called
 - `"disconnecting" → "released"`: saves drained, disconnect save committed, release UpdateAsync confirmed
 - `"disconnecting" → "abandoned"`: drain deadline exceeded; disconnectSave detects session loss; disconnectSave all retries exhausted; or releaseSession all retries exhausted
 - `"active" → "invalidated"`: confirmed session loss in `savePlayer` or `refreshSession`, **only when `playerState` is still `"active"` AND `sessionTokens[userId]` still equals the captured token at the time of result verification** — see §7.2 for the dual identity check
-- `"released" → nil` / `"abandoned" → nil`: cleared explicitly by `disconnectPlayer` cleanup after all async operations finish, enabling a legitimate rejoin on the same server
+- `"released" → nil`: cleared by `disconnectPlayer` step 7 (normal and save-failed paths) after all async operations complete; enables same-server rejoin
+- `"abandoned" → nil`: on the save-failed abandoned path, cleared by `disconnectPlayer` step 7; on the drain-timeout abandoned path, deferred to `§6.3 Step 4` (save-completion handler) and cleared only after the last in-flight autosave completes and `inFlightSaves` reaches 0
 
-**Cleanup:** After `disconnectPlayer` completes (whether via normal release or any terminal path), all per-player state tables — including `playerState` itself — are cleared to nil: `playerState`, `loadedData`, `sessionTokens`, `activeLocks`, `lastRefresh`, `inFlightSaves`, `shuttingDown`.
+**Cleanup:** Cleanup ownership differs by path:
+
+- **Normal and save-failed paths:** `disconnectPlayer` step 7 clears all per-player state tables to nil: `playerState`, `loadedData`, `sessionTokens`, `activeLocks`, `lastRefresh`, `inFlightSaves`, `shuttingDown`.
+- **Drain-timeout path:** `disconnectPlayer` clears `loadedData`, `activeLocks`, and `shuttingDown`, then exits with `playerState = "abandoned"` while in-flight autosaves remain. The final cleanup of `sessionTokens`, `inFlightSaves`, and `playerState` is deferred to `§6.3 Step 4`, which fires from the save-completion handler after the last autosave completes and `inFlightSaves` reaches 0.
 
 `sessionTokens[userId]` is cleared in step 7 (normal and save-failed paths) or by §6.3 (drain-timeout path). It is **not** cleared in step 2 — doing so early would prevent §6.3's dual identity check from verifying which session's save is completing in the drain-timeout path (see D-20).
 
@@ -540,7 +544,7 @@ The token is captured once before the `UpdateAsync` call. The callback and all r
 
 If either check fails, this refresh operation belongs to a stale or disconnecting session. It must not modify `playerState`, `invalidated`, `lastRefresh`, or kick the player.
 
-**Why the second check is necessary:** After `disconnectPlayer` completes its cleanup and clears `playerState[userId]` to nil, the player can rejoin on the same server and `loadPlayer` can run again (§5.1 accepts nil state). The new session T_B sets `playerState[userId] = "active"` and `sessionTokens[userId] = T_B`. If the old T_A refresh completes now, `playerState == "active"` passes — but `sessionTokens[userId] == T_B ≠ T_A` (the captured token). The second check catches this case. Without it, the stale T_A refresh would invalidate and kick the new T_B session.
+**Why the second check is necessary:** After cleanup clears `playerState[userId]` to nil (step 7 on normal/save-failed paths; `§6.3 Step 4` on the drain-timeout path), the player can rejoin on the same server and `loadPlayer` can run again (§5.1 accepts nil state). The new session T_B sets `playerState[userId] = "active"` and `sessionTokens[userId] = T_B`. If the old T_A refresh completes now, `playerState == "active"` passes — but `sessionTokens[userId] == T_B ≠ T_A` (the captured token). The second check catches this case. Without it, the stale T_A refresh would invalidate and kick the new T_B session.
 
 ```
 local token = sessionTokens[userId]  -- capture before UpdateAsync; stable reference
