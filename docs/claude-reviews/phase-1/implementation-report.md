@@ -1,9 +1,9 @@
-# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 6)
+# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 7)
 
 **Date:** 2026-11-24
 **Branch:** `feature/phase-1-data-foundation` (commit b05aa20)
 **Review branch:** `claude-review/phase-1`
-**Status:** Revision 6 — pending approval before implementation
+**Status:** Revision 7 — pending approval before implementation
 
 ---
 
@@ -304,3 +304,52 @@ The result: the final disconnect save was silently skipped. All normal-path time
 | D-14 — savePlayer rejects disconnect save | `disconnectPlayer` set state→"disconnecting" and cleared `sessionTokens` before calling `savePlayer`; both guards rejected it → no save, no release | `disconnectSave(userId, player, token, snapshot)` accepts "disconnecting" state and uses explicit token+snapshot; `disconnectPlayer` calls it after drain with captured token and post-drain snapshot |
 | "releasing" state references | §6.1 and §9.2 guards referenced non-existent "releasing" state; also R7 described it as valid | Removed all "releasing" references; `savePlayer` accepts "active" only; `getData` checks "active" only; R7 updated |
 | In-flight refresh TTL extension | Abandoned-path timelines described TTL countdown starting from activeLocks clear | Documented in §7.5 and Risk 8: TTL countdown starts from last `_session.since` DataStore write, which may be later than activeLocks clear if a refresh was in-flight when disconnect began |
+
+---
+
+## Defects Found in Revision 6 Architecture (9a640fc)
+
+### D-15: `refreshSession` callback reads `sessionTokens[userId]` live — race with disconnect (CRITICAL)
+
+**File:** `PlayerDataManager.lua` (design)
+
+In Revision 6, §7.1 showed the refresh callback comparing `current._session.token ~= sessionTokens[userId]` (reading the shared mutable table directly). §7.2 captured a local `token = sessionTokens[userId]` before the `UpdateAsync` call, but the **callback** did not use that captured value.
+
+This created a race:
+
+1. `refreshSession` starts, capturing `local token = sessionTokens[userId]` (= T_A).
+2. The callback is constructed — but its body reads `sessionTokens[userId]` live, not the captured `token`.
+3. `disconnectPlayer` runs, sets `sessionTokens[userId] = nil`.
+4. The callback is retried by Roblox.
+5. Inside the retry: `current._session.token ~= sessionTokens[userId]` → `T_A ~= nil` → true → callback returns nil.
+6. §7.2 result handler: `result == nil` → `playerState[userId] = "invalidated"` + kick.
+7. `disconnectSave` requires `playerState[userId] == "disconnecting"` → state is now `"invalidated"` → returns false.
+8. Final disconnect save is skipped. Session is abandoned without saving. Player is kicked mid-disconnect.
+
+**Additional issue:** Even with a correctly captured token, the §7.2 result handler always set `"invalidated"` and kicked the player on nil result — without checking whether the player was already in `"disconnecting"` state. This meant any ownership-loss signal during a disconnect (even legitimate ones) would fight with the disconnect lifecycle.
+
+**Fix:**
+1. §7.1 callback must use the captured `token` (not live `sessionTokens[userId]`). The comment in §7.1 is explicit: "token is a captured read-only local."
+2. §7.2 result handler: before transitioning to `"invalidated"`, check `playerState[userId] ~= "active"`. If the player is in `"disconnecting"` or any post-disconnect state, return false without modifying `playerState` or kicking.
+3. §7.3 persistent failure: apply the same state guard before transitioning to `"invalidated"`.
+
+See architecture §7.1, §7.2, §7.3 (Revision 7).
+
+---
+
+## Revised Requirements (Revision 7 additions)
+
+| ID | Requirement | Source defect | Architecture section |
+|---|---|---|---|
+| R22 | The `refreshSession` callback must capture `token = sessionTokens[userId]` once in the outer function before the `UpdateAsync` call and use that captured value inside the callback. The callback must not read `sessionTokens[userId]` directly. The §7.2 result handler and §7.3 persistent-failure handler must each check `playerState[userId] == "active"` before transitioning to `"invalidated"` or kicking. If the player is in any other state (`"disconnecting"`, `"released"`, `"abandoned"`, etc.), both handlers must return false without modifying `playerState` or calling `Kick`. | D-15 | §7.1, §7.2, §7.3 |
+
+---
+
+## Summary of Changes from Revision 6 (9a640fc)
+
+| Issue | Revision 6 problem | Revision 7 fix |
+|---|---|---|
+| D-15 — refresh callback reads sessionTokens live | §7.1 callback read `sessionTokens[userId]` directly; cleared by disconnectPlayer mid-retry → callback returns nil → "invalidated" overwrites "disconnecting" → disconnectSave rejects | §7.1 callback uses captured `token` (read-only local); §7.2 and §7.3 handlers check `playerState == "active"` before invalidating or kicking |
+| Stale state description in §4 "abandoned" | "abandoned" only described drain-timeout; did not mention session-stolen path from disconnectSave | Updated to include "session stolen during disconnectSave" |
+| Stale §4 cleanup note | Listed only some state tables; said "On PlayerRemoving" | Updated to list all tables (including `inFlightSaves`, `shuttingDown`) and attributed cleanup to `disconnectPlayer` |
+| Stale §7.5 | Described in-flight refresh risk without addressing whether the refresh would falsely detect ownership loss or overwrite disconnect state | Revised to explain: fixed callback prevents false ownership loss; state guard prevents "invalidated" overwrite; TTL-extension risk remains in abandoned path only |

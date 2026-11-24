@@ -1,8 +1,8 @@
-# Phase 1 Test Results — Cash Empire Tycoon (Revision 6)
+# Phase 1 Test Results — Cash Empire Tycoon (Revision 7)
 
 **Date:** 2026-11-24
 **Commit under review:** b05aa20 (`feature/phase-1-data-foundation`)
-**Review revision:** 6
+**Review revision:** 7
 **Status:** Test plan revised — runtime tests not yet executed
 
 > **Note:** All test results in this document are design-level analysis. No runtime tests have been executed. Test scenarios marked PASS/FAIL reflect whether the revised design is expected to handle them correctly, not observed runtime behaviour.
@@ -20,7 +20,7 @@
 | Stale lock (TTL expired) allows new server to acquire | Acquisition callback: `(now - sess.since) >= LOCK_TTL` → available for acquisition | Yes |
 | `addCash`/`spendCash` blocked after session loss | `invalidated[userId]=true` → `getData` returns nil → operations return false/nil | Yes |
 | Duplicate disconnect ownership rejected | `shuttingDown[userId]` guard: second caller (PlayerRemoving or BindToClose) returns immediately without any DataStore call | Yes |
-| BindToClose completes within 25 s deadline | Parallel saves with `task.wait(0.1)` poll; deadline enforced | Yes |
+| BindToClose completes within 25 s deadline | Each player gets a concurrent `task.spawn(disconnectPlayer)` — per-player disconnect is serialized (drain→save→release); BindToClose waits up to 25 s for all to finish | Yes |
 | Legacy records (no `_session`) load correctly | Acquisition callback: `current._session == nil` → treated as available; all existing fields preserved | Yes |
 | `_session` never in `getData` return value | `loadedData[userId]` populated without `_session` at load time; `getData` returns that table | Yes |
 
@@ -161,46 +161,57 @@ DESIGN: PASS
 
 ### Save Snapshot Correctness (NEW — Revision 4, D-6)
 
-**Scenario SS-1: releaseSession clears loadedData while save callback is mid-retry**
+**Scenario SS-1: disconnectPlayer clears loadedData while autosave callback is mid-retry (drain-timeout path)**
 
 ```
-Setup:    Server A: savePlayer starts for Player X.
+Setup:    Server A: autosave (savePlayer) starts for Player X.
           token=T_A, snapshot=deepCopy(loadedData[X]) captured before UpdateAsync.
           loadedData[X] = {Cash:500}.
 Step 1:   savePlayer UpdateAsync yields (callback in progress).
-Step 2:   releaseSession runs: loadedData[X] = nil (cleared in PlayerRemoving cleanup).
-Step 3:   Roblox retries save callback (ack lost on first attempt).
+Step 2:   PlayerRemoving fires. disconnectPlayer(X): shuttingDown[X]=true; drain wait.
+          Drain deadline exceeded (autosave stalled). state→"abandoned".
+          Cleanup: loadedData[X]=nil (cleared by disconnectPlayer, not releaseSession).
+Step 3:   Roblox retries autosave callback (ack lost on first attempt).
           Callback reads: snapshot (local variable, deepCopy) → {Cash:500} ✓
                           token (local variable) → T_A ✓
           Neither reads loadedData[X] (which is now nil).
 Step 4:   current._session.token == T_A → callback writes {Cash:500, _session:{T_A}}.
 Step 5:   result._session.token == T_A → save confirmed ✅
-Expected: Correct data written even after loadedData cleared. DESIGN: PASS
+Expected: Correct data written even after disconnectPlayer cleared loadedData. DESIGN: PASS
 
 Broken (Revision 3) behaviour at Step 3:
           Callback reads: loadedData[X] → nil → deepCopy(nil) → error or empty record ← WRONG
 ```
 
-**Scenario SS-2: Two overlapping saves with different snapshots — ordering**
+**Scenario SS-2: Autosave drains first; disconnect save takes fresher snapshot (current design)**
 
 ```
+Current design (Revision 5+): saves are serialized by disconnectPlayer.
+
 Setup:    Autosave (time T0) captures snapshot_T0 = {Cash:100}.
           addCash(50) runs: loadedData[X].Cash = 150.
-          PlayerRemoving save (time T1) captures snapshot_T1 = {Cash:150}.
-          Both UpdateAsync calls are in-flight.
+          PlayerRemoving fires.
+Step 1:   disconnectPlayer: drain wait; inFlightSaves[X]==1 → loops.
+Step 2:   Autosave UpdateAsync completes; inFlightSaves[X]=0.
+          DataStore: {Cash:100, _session:{T_A}}.
+Step 3:   Drain passes. snapshot_T1=deepCopy(loadedData[X])={Cash:150}.
+          disconnectSave(X, player, T_A, snapshot_T1); UpdateAsync.
+Step 4:   disconnectSave callback: T_A matches → writes {Cash:150, _session:{T_A}}.
+          inFlightSaves[X]=0; return true.
+Step 5:   releaseSession → released=true.
+Expected: Final DataStore = {Cash:150} (fresh snapshot). No two saves in-flight. DESIGN: PASS
+```
+
+Historical (Revision 4 — D-12 defect, fixed in Revision 5):
+
+```
+Both PlayerRemoving save and autosave in-flight simultaneously:
 Step 1:   releaseSession waits for inFlightSaves[X] == 2 → loops.
-Step 2:   DataStore serializes: autosave (snapshot_T0) commits first.
-          DataStore now has {Cash:100, _session:{T_A}}.
-Step 3:   PlayerRemoving save (snapshot_T1) callback: T_A matches → writes {Cash:150, _session:{T_A}}.
-          inFlightSaves[X] = 0 → releaseSession wait exits.
-Step 4:   release UpdateAsync commits → {Cash:150, _session:{T_A, released:true}}.
-Final DataStore state: {Cash:150, ...} ✅ (most recent snapshot committed last)
-Note:     This ordering holds because releaseSession waited for both saves.
-          If DataStore had serialized PlayerRemoving save first (Step 2 reversed),
-          the autosave would commit {Cash:100} last — data 50 coins stale.
-          This is Risk 6 in §15 of architecture.md.
-Expected: At worst one autosave interval of staleness (60s earnings).
-          Release always comes after both saves. DESIGN: PASS (with Risk 6 noted)
+Step 2:   DataStore serializes: PlayerRemoving save (snapshot_T1={Cash:150}) commits first.
+Step 3:   Autosave (snapshot_T0={Cash:100}) commits last → overwrites disconnect save.
+          Final DataStore: {Cash:100} ← DATA STALE (worst ordering).
+Note:     This is Risk 6 in §15 of architecture.md. The current design eliminates
+          this risk by draining autosaves before the disconnect save starts.
 ```
 
 ### Refresh Non-Nil Wrong-Token Result (NEW — Revision 4, D-8)
@@ -395,6 +406,56 @@ Step 4:   DataStore has _session.since = T2 (from in-flight refresh at step 2).
 DESIGN: PASS with Risk 8 documented (TTL anchor is T2, not T1).
 ```
 
+**Scenario IW-5: Refresh callback retry after sessionTokens cleared — no false ownership loss (NEW — Revision 7, D-15)**
+
+```
+Setup:    Server A: refreshSession starts; local token = sessionTokens[X] = T_A captured.
+          disconnectPlayer fires: sessionTokens[X] = nil.
+          Roblox retries refresh callback (network ack lost).
+Step 1:   Refresh callback: current._session.token vs captured token T_A.
+          captured T_A is a read-only local — sessionTokens[X]=nil has no effect on it.
+          current._session.token == T_A → callback writes updated _session.since ✅
+Step 2:   Refresh result handler: result._session.token == T_A → lastRefresh[X] updated.
+          No ownership loss. No invalidation. No kick.
+Step 3:   disconnectPlayer proceeds: drain (refresh does not use inFlightSaves).
+          disconnectSave called; state still "disconnecting" ✅
+Expected: Captured token prevents false ownership loss. disconnectSave unblocked. DESIGN: PASS
+
+Broken (Revision 6) behaviour:
+          Callback: current._session.token ~= sessionTokens[X] (nil) → return nil.
+          Result handler: result==nil → playerState[X]="invalidated".
+          disconnectSave: playerState[X] ≠ "disconnecting" → return false. Final save skipped ← D-15
+```
+
+**Scenario IW-6: Refresh completes while state is "disconnecting" — state guard prevents interference (NEW — Revision 7, D-15)**
+
+```
+Setup:    refreshSession is in-flight (UpdateAsync yielded). disconnectPlayer starts;
+          state→"disconnecting"; sessionTokens[X]=nil.
+          Refresh UpdateAsync eventually returns.
+Case A:   result._session.token == T_A (refresh committed).
+          Result handler: playerState[X] == "disconnecting" ≠ "active" → return false.
+          No invalidation. No kick. ✅
+Case B:   result._session.token ≠ T_A or result==nil (another server took over or nil).
+          Result handler: playerState[X] == "disconnecting" ≠ "active" → return false.
+          No invalidation overwrite. ✅ (disconnect lifecycle owns state)
+Step next: disconnectSave proceeds; playerState[X] still "disconnecting" ✅
+Expected: Refresh result cannot overwrite "disconnecting" state. disconnectSave unblocked. DESIGN: PASS
+```
+
+**Scenario IW-7: Refresh completes after releaseSession — state guard prevents interference (NEW — Revision 7, D-15)**
+
+```
+Setup:    refreshSession UpdateAsync is in-flight. disconnectPlayer completes:
+          state→"released"; loadedData[X]=nil; sessionTokens[X]=nil.
+          Delayed refresh result finally returns.
+Step 1:   Refresh result handler: playerState[X] == "released" ≠ "active" → return false.
+          No invalidation. No kick. ✅
+Step 2:   If persistent-failure handler also fires (e.g., multiple errors after release):
+          TTL check: playerState[X] ≠ "active" → return false. No kick. ✅
+Expected: Post-release refresh completion is a silent no-op. DESIGN: PASS
+```
+
 ---
 
 **Scenario SR-1: Autosave in-flight when PlayerRemoving fires (updated for Revision 6)**
@@ -462,8 +523,9 @@ Expected: No DataStore call. DESIGN: PASS
 **Scenario C-1: Normal acquire → save → release**
 
 ```
-Expected: acquisition confirmed by token match; save confirmed by token match; release marks released=true.
-State transitions: nil→loading→active→releasing→released. DESIGN: PASS
+Expected: acquisition confirmed by token match; autosave confirmed by token match;
+          disconnectPlayer: drain→disconnectSave→releaseSession → released=true.
+State transitions: nil→loading→active→disconnecting→released. DESIGN: PASS
 ```
 
 **Scenario C-2: Two servers attempt simultaneous acquisition**
@@ -489,8 +551,8 @@ DESIGN: PASS
 ```
 Server A: refreshSession UpdateAsync yields. Server B: loadPlayer UpdateAsync yields.
 Case 1: Server A refresh wins. Server B sees T_A with fresh `since` → TTL live → Server B aborts.
-Case 2: Server B acquires first (T_B in DataStore). Server A refresh callback: T_A ≠ T_B → nil.
-        Server A: refresh returns nil → invalidated[X]=true → Server A kicks its player.
+Case 2: Server B acquires first (T_B in DataStore). Server A refresh callback: captured T_A ≠ T_B → nil.
+        Server A: state=="active" → invalidated[X]=true → Server A kicks its player.
 DESIGN: PASS (both orderings handled)
 ```
 
@@ -518,8 +580,9 @@ DESIGN: PASS
 **Scenario R-3: Refresh detects stolen session (token mismatch)**
 
 ```
-Callback: current._session.token ≠ sessionTokens[X] → return nil.
-Outer: result == nil → invalidated[X]=true; playerState="invalidated"; player kicked.
+Callback: captured token T_A; current._session.token == T_B ≠ T_A → return nil.
+Outer: result == nil; playerState[X]=="active" → state guard passes →
+       invalidated[X]=true; playerState="invalidated"; player kicked.
 DESIGN: PASS
 ```
 
@@ -527,11 +590,17 @@ DESIGN: PASS
 
 ### Duplicate Save Scenarios
 
-**Scenario D-1: Autosave + PlayerRemoving save (normal path)**
+**Scenario D-1: Autosave then PlayerRemoving (serialized by disconnectPlayer)**
 
-Both saves: state=="active"/"releasing"; token T_A captured; both UpdateAsync calls serialized by DataStore.
-Both callbacks match T_A → both writes succeed (second is idempotent — same token, same data).
-DESIGN: PASS
+```
+Autosave runs while state=="active"; token T_A captured; UpdateAsync completes.
+PlayerRemoving fires: disconnectPlayer starts; state→"disconnecting".
+drain wait: inFlightSaves[X]==0 (autosave already done) → pass immediately.
+snapshot taken; disconnectSave called with T_A.
+One save at a time — no two saves in-flight simultaneously. DESIGN: PASS
+```
+Note: The old model (two saves both in-flight, serialized by DataStore) was fixed in Revision 5
+(D-12). The current design serializes saves: autosave first, disconnect save only after drain.
 
 **Scenario D-2: Autosave after session invalidated**
 
@@ -547,9 +616,13 @@ Autosave: savePlayer → state check: "invalidated" ≠ "active" → return fals
 **Scenario S-1: Normal shutdown (PlayerRemoving completes before BindToClose)**
 
 ```
-PlayerRemoving: save + release → state "released"; loadedData[X]=nil.
-BindToClose: savePlayer → state "released" → return false. releaseSession → state ≠ "active" → no-op.
+PlayerRemoving: disconnectPlayer(X) → shuttingDown[X]=true; drain→disconnectSave→releaseSession.
+               state→"released"; loadedData[X]=nil.
+BindToClose: disconnectPlayer(X) → shuttingDown[X]==true → return immediately (no-op).
 DESIGN: PASS
+
+Historical (pre-Revision 5): PlayerRemoving called savePlayer+releaseSession directly;
+BindToClose called savePlayer independently. Replaced by disconnectPlayer in Revision 5.
 ```
 
 **Scenario S-2: Rapid shutdown (BindToClose fires before PlayerRemoving completes)**
@@ -591,6 +664,19 @@ The following tests must be executed in Roblox Studio after implementation. None
 
 ---
 
+## Tests Added for Revision 7 (Architecture Issue D-15)
+
+| Test | Issue covered | Scenario reference |
+|---|---|---|
+| Refresh callback retry after sessionTokens cleared — captured token prevents false ownership loss | D-15 — live sessionTokens read in callback | IW-5 |
+| Refresh completion during "disconnecting" state — state guard prevents invalidation | D-15 — invalidated overwrites disconnect state | IW-6 |
+| Refresh completion after releaseSession (state "released") — state guard no-op | D-15 | IW-7 |
+| R-3 updated: callback uses captured T_A, not live sessionTokens | D-15 | R-3 (updated) |
+| SS-1 updated: loadedData cleared by disconnectPlayer, not releaseSession | D-15 / correctness | SS-1 (updated) |
+| SS-2 updated: current serialized design replaces Revision 4 dual-save | D-15 / D-12 historical | SS-2 (updated) |
+| S-1 updated: disconnectPlayer replaces direct savePlayer+releaseSession | D-15 / Revision 5 | S-1 (updated) |
+| D-1 updated: single serialized save path, no dual-save model | D-15 / D-12 historical | D-1 (updated) |
+
 ## Tests Added for Revision 6 (Architecture Issues D-14, Risk 8)
 
 | Test | Issue covered | Scenario reference |
@@ -620,7 +706,7 @@ The following tests must be executed in Roblox Studio after implementation. None
 
 | Test | Issue covered | Scenario reference |
 |---|---|---|
-| Save callback retried after loadedData cleared by releaseSession | D-6 — save snapshot | SS-1 |
+| Save callback retried after loadedData cleared by disconnectPlayer (drain-timeout path) | D-6 — save snapshot | SS-1 (updated) |
 | Two overlapping saves with different snapshots — ordering and staleness | D-6 | SS-2 |
 | refreshSession — non-nil wrong-token result treated as ownership loss | D-8 — refresh verification | RV-1 |
 | refreshSession — nil result treated as ownership loss | D-8 | RV-2 |
@@ -641,7 +727,7 @@ The following tests must be executed in Roblox Studio after implementation. None
 | Same-server different-token (expired TTL) | Issue 2 | DS-3 |
 | addCash blocked after refresh detects session loss | Issue 3 — mutation after ownership loss | ML-1 |
 | addCash blocked after failed load | Issue 3 | ML-2 |
-| getData allowed in "releasing" state | Issue 3 | ML-3 |
+| getData blocked in "disconnecting" state (historical: "releasing" state; renamed in Revision 5) | Issue 3 | ML-3 (updated) |
 | In-flight save + concurrent release | Issue 4 — save/release coordination | SR-1 |
 | New save attempt after sessionTokens cleared | Issue 4 | SR-2 |
 | Duplicate releaseSession from PlayerRemoving + BindToClose | Issue 4 | SR-3 |

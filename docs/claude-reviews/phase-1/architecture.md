@@ -1,8 +1,8 @@
-# Phase 1 Architecture — Cash Empire Tycoon (Revision 6)
+# Phase 1 Architecture — Cash Empire Tycoon (Revision 7)
 
 **Date:** 2026-11-24
 **Scope:** `PlayerDataManager.lua` session locking design
-**Status:** Revision 6 — pending approval before implementation
+**Status:** Revision 7 — pending approval before implementation
 
 ---
 
@@ -97,7 +97,7 @@ session loss   disconnectPlayer called
 | "active" | Session held; data valid | getData, addCash, spendCash, savePlayer |
 | "disconnecting" | Disconnect lifecycle in progress | disconnectSave (called only by disconnectPlayer after drain; uses explicit token+snapshot) |
 | "released" | Session explicitly released in DataStore | — (all operations blocked) |
-| "abandoned" | Disconnect deadline exceeded; session expires by TTL | — (all operations blocked) |
+| "abandoned" | Disconnect deadline exceeded, or session stolen during disconnectSave; session expires by TTL | — (all operations blocked) |
 | "failed" | Load failed | — (all operations blocked) |
 | "invalidated" | Session stolen mid-game | — (all operations blocked) |
 
@@ -108,10 +108,10 @@ session loss   disconnectPlayer called
 - `"loading" → "failed"`: after all load retries exhausted
 - `"active" → "disconnecting"`: start of `disconnectPlayer`; first caller wins (see §10)
 - `"disconnecting" → "released"`: saves drained, disconnect save committed, release UpdateAsync confirmed
-- `"disconnecting" → "abandoned"`: drain or save deadline exceeded; no release UpdateAsync issued
-- `"active" → "invalidated"`: confirmed session loss in `savePlayer` or `refreshSession`
+- `"disconnecting" → "abandoned"`: drain deadline exceeded; disconnectSave detects session loss; disconnectSave all retries exhausted; or releaseSession all retries exhausted
+- `"active" → "invalidated"`: confirmed session loss in `savePlayer` or `refreshSession`, **only when `playerState` is still `"active"` at the time of result verification** — see §7.2 for the state guard
 
-**Cleanup:** On `PlayerRemoving`, all state tables (`playerState`, `loadedData`, `sessionTokens`, `activeLocks`, `lastRefresh`) are cleared after save and release complete.
+**Cleanup:** After `disconnectPlayer` completes (whether via normal release or any terminal path), all per-player state tables (`playerState`, `loadedData`, `sessionTokens`, `activeLocks`, `lastRefresh`, `inFlightSaves`, `shuttingDown`) are cleared.
 
 ---
 
@@ -469,10 +469,15 @@ return true
 
 The callback updates `_session.since` to prevent TTL expiry. It verifies ownership from the returned record — no closure mutation.
 
+**The callback must capture `token` as a read-only closure variable and compare against that captured value.** It must never read `sessionTokens[userId]` directly inside the callback body — that table is cleared by `disconnectPlayer` before the disconnect save, and a callback retried after that point would compare against nil, falsely appearing as ownership loss. The token is captured once in the outer function (§7.2) before the `UpdateAsync` call.
+
 ```
+-- token is captured in §7.2 as: local token = sessionTokens[userId]
+-- The callback closes over this immutable captured value.
+
 callback(current):
     if current == nil or current._session == nil: return nil
-    if current._session.token ~= sessionTokens[userId]:  return nil
+    if current._session.token ~= token: return nil  -- token is a captured read-only local
     newRecord = deepCopy(current)
     newRecord._session.since = os.time()
     return newRecord
@@ -480,10 +485,13 @@ callback(current):
 
 ### 7.2 Verification after UpdateAsync
 
-Success is confirmed only when `result._session.token == sessionTokens[userId]`. Every other non-error outcome is treated as ownership loss: this includes `result == nil` (callback returned nil) and `result ~= nil but result._session.token ~= sessionTokens[userId]` (callback returned nil and UpdateAsync returned the existing record with another server's token — see §15 Risk 1).
+The token is captured once before the `UpdateAsync` call. The callback and all result verification use this captured local — `sessionTokens[userId]` is never read again after capture. This is the same pattern as §6.1–6.3 (savePlayer) and prevents incorrect ownership-loss detection if `disconnectPlayer` clears `sessionTokens[userId]` while the callback is in-flight or being retried.
+
+Success is confirmed only when `result._session.token == token` (the captured value). Every other non-error outcome must check whether the state has transitioned away from `"active"` before treating it as ownership loss — see the state guard below.
 
 ```
 local token = sessionTokens[userId]  -- capture before UpdateAsync; stable reference
+                                     -- callback uses this value, not sessionTokens[userId]
 ok, result = pcall(PlayerStore.UpdateAsync, userId, callback)
 
 if ok:
@@ -493,7 +501,18 @@ if ok:
     else:
         -- result == nil (callback returned nil) OR
         -- result._session.token ~= token (non-nil result, wrong token)
-        -- Both indicate ownership loss.
+        -- The callback returned nil. This may be genuine ownership loss, OR it may
+        -- be an expected nil from a retry after disconnectPlayer cleared sessionTokens.
+        -- Either way, with the fixed callback (using captured token), nil means the
+        -- callback correctly detected a token mismatch in DataStore.
+        
+        if playerState[userId] ~= "active":
+            -- Disconnect or post-disconnect state: "disconnecting", "released", "abandoned".
+            -- Do NOT set "invalidated": the disconnect lifecycle handles cleanup.
+            -- Do NOT kick: the player is already leaving or has already left.
+            return false
+        
+        -- Genuine ownership loss in "active" state.
         playerState[userId] = "invalidated"
         invalidated[userId] = true
         warn("Session ownership lost during refresh for userId=" .. userId)
@@ -508,18 +527,20 @@ if not ok:
 
 ### 7.3 Persistent refresh failure handling
 
-The refresh loop tracks `lastRefresh[userId]`. On each failure:
+The refresh loop tracks `lastRefresh[userId]`. On each DataStore error:
 
 ```
 if os.time() - (lastRefresh[userId] or 0) > LOCK_TTL:
-    -- Lock has certainly expired; treat as stolen
-    -- Apply same path as confirmed session loss above
+    -- Lock has certainly expired; treat as stolen.
+    if playerState[userId] ~= "active":
+        return false   -- disconnect in progress or already complete; do not interfere
+    -- Genuine TTL expiry in "active" state.
     playerState[userId] = "invalidated"
     invalidated[userId] = true
     kick(...)
 ```
 
-A single transient failure does not trigger a kick if `os.time() - lastRefresh < LOCK_TTL` (the lock has not yet expired).
+A single transient failure does not trigger a kick if `os.time() - lastRefresh < LOCK_TTL` (the lock has not yet expired). The state guard applies equally to the TTL-expiry path.
 
 ### 7.4 Refresh loop
 
@@ -536,21 +557,23 @@ task.spawn(function()
 end)
 ```
 
-### 7.5 In-flight refresh at disconnect — TTL extension analysis
+### 7.5 In-flight refresh at disconnect — lifecycle interaction and TTL analysis
 
-When `disconnectPlayer` clears `activeLocks[userId]` (§10.1 step 2), the refresh loop stops iterating this player on its next cycle. However, a `refreshSession` task that is **already running** (yielded inside its `UpdateAsync`) is not interrupted. It captured its `token` before the disconnect and continues to completion.
+When `disconnectPlayer` clears `activeLocks[userId]` (§10.1 step 2), the refresh loop stops iterating this player on its next cycle. However, a `refreshSession` task that is **already running** (yielded inside its `UpdateAsync`) is not interrupted. It captured its `token` from `sessionTokens[userId]` before the disconnect and continues to completion with that captured value.
 
-**Can an in-flight refresh extend the TTL after `activeLocks` is cleared?**
+**Will the in-flight refresh falsely detect ownership loss?**
 
-Yes. If the in-flight refresh completes successfully after `disconnectPlayer` has cleared `activeLocks`, it writes `_session.since = os.time()` to DataStore. Another server's acquisition callback computes `(now - sess.since) >= LOCK_TTL` from that value, so the effective TTL countdown restarts from that refresh write time.
+No — with the fixed callback (§7.1). The callback uses the captured `token` (not live `sessionTokens[userId]`). Even after `disconnectPlayer` clears `sessionTokens[userId] = nil`, the callback still compares `current._session.token ~= T_A` (the captured value). If the session has not been stolen, the comparison succeeds and the refresh completes normally. Only a genuine token mismatch in DataStore (another server holds the session) causes the callback to return nil.
 
-**Impact on the abandoned path:**
+**Will the in-flight refresh overwrite `"disconnecting"` state?**
 
-In the abandoned path (drain timeout), `releaseSession` is never called. Another server can acquire only after `(now - sess.since) >= LOCK_TTL`.
+No. The §7.2 result handler checks `playerState[userId] ~= "active"` before transitioning to `"invalidated"`. If the player is in `"disconnecting"` state at the time the refresh result is checked, the handler returns false without modifying `playerState`. `disconnectSave` can proceed normally.
 
-The TTL fallback becomes available **LOCK_TTL seconds after the last successful `_session.since` write in DataStore**, not LOCK_TTL seconds after `activeLocks` was cleared. If an in-flight refresh completes after disconnect begins, the effective delay before another server can acquire is LOCK_TTL seconds from that refresh write, not from when `activeLocks` was removed. This risk is documented in §15 Risk 8.
+**Can an in-flight refresh extend the TTL?**
 
-**Normal disconnect path is unaffected:** In the normal path, `disconnectSave` and `releaseSession` both complete. `releaseSession` writes `released=true`. Another server's acquisition callback sees `released=true` and can acquire immediately regardless of `_session.since`. The in-flight refresh has no effect on rejoin availability in the normal path.
+Yes. If the refresh completes successfully, it writes `_session.since = os.time()` to DataStore. In the **normal path**, `disconnectSave` and `releaseSession` both complete, writing `released=true`. Another server can acquire immediately from `released=true`, regardless of `_session.since`. The in-flight refresh has no effect.
+
+In the **abandoned path** (drain timeout), `releaseSession` is never called. Another server can acquire only after `(now - sess.since) >= LOCK_TTL`. The TTL fallback becomes available **LOCK_TTL seconds after the last successful `_session.since` write in DataStore**, which may be later than when `activeLocks` was cleared if an in-flight refresh completed after disconnect began. This residual risk is documented in §15 Risk 8.
 
 ---
 
