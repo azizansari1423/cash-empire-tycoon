@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-25
 **Scope:** `PlayerDataManager.lua` session locking design
-**Status:** Revision 10 — pending approval before implementation
+**Status:** Revision 11 — pending approval before implementation
 
 ---
 
@@ -258,7 +258,7 @@ return data
 
 ### 6.1 Guards and immutable snapshot
 
-All values the callback needs must be captured before the UpdateAsync call. The callback must not read any shared mutable state (`loadedData`, `sessionTokens`) because those tables can be cleared during disconnection while the callback is mid-execution or being retried.
+All values the callback needs must be captured before the UpdateAsync call. The callback must not read any shared mutable state (`loadedData`, `sessionTokens`) because those tables can change while the callback is mid-execution or being retried: `loadedData[userId]` is cleared in the disconnect path; `sessionTokens[userId]` is cleared by step-7 cleanup or overwritten when a new session starts.
 
 `savePlayer` is the **autosave path only**. It accepts state `"active"` exclusively. When `disconnectPlayer` sets state to `"disconnecting"`, all future `savePlayer` calls are rejected immediately at the state guard. The disconnect path uses a separate internal function (`disconnectSave`; see §6.5) that accepts `"disconnecting"` state and receives an explicit token and snapshot from `disconnectPlayer`.
 
@@ -516,7 +516,7 @@ return true
 
 The callback updates `_session.since` to prevent TTL expiry. It verifies ownership from the returned record — no closure mutation.
 
-**The callback must capture `token` as a read-only closure variable and compare against that captured value.** It must never read `sessionTokens[userId]` directly inside the callback body — that table is cleared by `disconnectPlayer` before the disconnect save, and a callback retried after that point would compare against nil, falsely appearing as ownership loss. The token is captured once in the outer function (§7.2) before the `UpdateAsync` call.
+**The callback must capture `token` as a read-only closure variable and compare against that captured value.** It must never read `sessionTokens[userId]` directly inside the callback body — that table is shared mutable state that can change between callback retries (cleared by step-7 cleanup after a normal disconnect, or changed to a new session's token if the player rejoins as T_B). The captured local `token` is the only stable reference across all retry scenarios. The token is captured once in the outer function (§7.2) before the `UpdateAsync` call.
 
 ```
 -- token is captured in §7.2 as: local token = sessionTokens[userId]
@@ -532,7 +532,7 @@ callback(current):
 
 ### 7.2 Verification after UpdateAsync
 
-The token is captured once before the `UpdateAsync` call. The callback and all result verification use this captured local — `sessionTokens[userId]` is never read again after capture. This is the same pattern as §6.1–6.3 (savePlayer) and prevents incorrect ownership-loss detection if `disconnectPlayer` clears `sessionTokens[userId]` while the callback is in-flight or being retried.
+The token is captured once before the `UpdateAsync` call. The callback and all result verification use this captured local — `sessionTokens[userId]` is never read again after capture. This is the same pattern as §6.1–6.3 (savePlayer) and prevents incorrect ownership-loss detection if `sessionTokens[userId]` changes while the callback is in-flight or being retried — for example, cleared by step-7 cleanup after a normal disconnect, or updated to T_B's token when the player rejoins.
 
 **Dual identity check:** Before applying any refresh result to per-player state, two conditions must both hold:
 1. `playerState[userId] == "active"` — the player has not entered a disconnect or post-disconnect state

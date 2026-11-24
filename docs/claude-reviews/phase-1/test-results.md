@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-25
 **Commit under review:** b05aa20 (`feature/phase-1-data-foundation`)
-**Review revision:** 10
+**Review revision:** 11
 **Status:** Test plan revised — runtime tests not yet executed
 
 > **Note:** All test results in this document are design-level analysis. No runtime tests have been executed. Test scenarios marked PASS/FAIL reflect whether the revised design is expected to handle them correctly, not observed runtime behaviour.
