@@ -1,6 +1,6 @@
-# Phase 1 Test Results — Cash Empire Tycoon (Revision 10)
+# Phase 1 Test Results — Cash Empire Tycoon (Revision 11)
 
-**Date:** 2026-11-24
+**Date:** 2026-11-25
 **Commit under review:** b05aa20 (`feature/phase-1-data-foundation`)
 **Review revision:** 10
 **Status:** Test plan revised — runtime tests not yet executed
@@ -276,8 +276,9 @@ No stale snapshot race; no data written after release. DESIGN: PASS (Revision 5)
 ```
 Setup:    Autosave in flight (inFlightSaves[X]=1). DataStore stalled.
 Step 1:   disconnectPlayer: drain wait; DRAIN_DEADLINE (5s) exceeded; inFlightSaves[X] still 1.
-Step 2:   state→"abandoned"; activeLocks[X]=nil (already set); sessionTokens[X]=nil (already set).
-          loadedData[X]=nil; lastRefresh[X]=nil; shuttingDown[X]=nil.
+Step 2:   state→"abandoned"; loadedData[X]=nil; lastRefresh[X]=nil; shuttingDown[X]=nil.
+          activeLocks[X]=nil (already cleared in step 2 of disconnectPlayer lifecycle).
+          sessionTokens[X]=T_A preserved (D-20 fix; cleared by §6.3 Step 4 after autosave completes).
           inFlightSaves[X] NOT cleared (autosave owns its slot).
 Step 3:   disconnectPlayer returns. No disconnect save. No release UpdateAsync.
 Step 4:   Autosave eventually completes: inFlightSaves[X] decremented → 0.
@@ -374,7 +375,7 @@ Step 3:   DataStore serializes: autosave (Cash:100) runs last → overwrites dis
 **Scenario SO-5: Autosave fires while in "disconnecting" state — rejected by savePlayer (NEW — Revision 6)**
 
 ```
-Setup:    disconnectPlayer(X) has started; playerState[X]="disconnecting"; sessionTokens[X]=nil.
+Setup:    disconnectPlayer(X) has started; playerState[X]="disconnecting"; sessionTokens[X]=T_A (preserved — D-20 fix).
           A coroutine (autosave loop) calls savePlayer(X).
 Step 1:   savePlayer: playerState[X] == "disconnecting" ≠ "active" → return false immediately.
           No DataStore call. No inFlightSaves increment. PASS
@@ -389,7 +390,7 @@ Expected: Autosave in "disconnecting" state is a silent no-op. DESIGN: PASS
 ```
 Setup:    Server A: refreshSession task running (UpdateAsync in progress; token T_A captured).
           disconnectPlayer fires concurrently.
-Step 1:   disconnectPlayer: activeLocks[X]=nil; sessionTokens[X]=nil.
+Step 1:   disconnectPlayer: activeLocks[X]=nil. (sessionTokens[X]=T_A preserved — D-20 fix.)
           Refresh loop will not start another refresh for X on next tick.
           But the currently-running refresh task continues with its captured token T_A.
 Step 2:   In-flight refresh completes: current._session.token == T_A == captured token.
@@ -413,14 +414,15 @@ Step 4:   DataStore has _session.since = T2 (from in-flight refresh at step 2).
 DESIGN: PASS with Risk 8 documented (TTL anchor is T2, not T1).
 ```
 
-**Scenario IW-5: Refresh callback retry after sessionTokens cleared — no false ownership loss (NEW — Revision 7, D-15)**
+**Scenario IW-5: Refresh callback retry during disconnect — captured token prevents false ownership loss (NEW — Revision 7, D-15; updated — Revision 11)**
 
 ```
 Setup:    Server A: refreshSession starts; local token = sessionTokens[X] = T_A captured.
-          disconnectPlayer fires: sessionTokens[X] = nil.
+          disconnectPlayer fires: activeLocks[X]=nil; state→"disconnecting".
+          (sessionTokens[X]=T_A preserved — D-20 fix; not cleared in step 2.)
           Roblox retries refresh callback (network ack lost).
 Step 1:   Refresh callback: current._session.token vs captured token T_A.
-          captured T_A is a read-only local — sessionTokens[X]=nil has no effect on it.
+          captured T_A is a read-only local; it is unaffected by any change to sessionTokens[X].
           current._session.token == T_A → callback writes updated _session.since ✅
 Step 2:   Refresh result handler: result._session.token == T_A → lastRefresh[X] updated.
           No ownership loss. No invalidation. No kick.
@@ -428,17 +430,20 @@ Step 3:   disconnectPlayer proceeds: drain (refresh does not use inFlightSaves).
           disconnectSave called; state still "disconnecting" ✅
 Expected: Captured token prevents false ownership loss. disconnectSave unblocked. DESIGN: PASS
 
-Broken (Revision 6) behaviour:
+Broken (Revision 6) behaviour (historical):
+          Revision 6: callback read live sessionTokens[X] instead of a captured local.
+          disconnectPlayer (Revision 6) cleared sessionTokens[X]=nil in step 2.
           Callback: current._session.token ~= sessionTokens[X] (nil) → return nil.
           Result handler: result==nil → playerState[X]="invalidated".
           disconnectSave: playerState[X] ≠ "disconnecting" → return false. Final save skipped ← D-15
+          Both root causes fixed: D-15 (captured token), D-20 (sessionTokens preserved).
 ```
 
 **Scenario IW-6: Refresh completes while state is "disconnecting" — state guard prevents interference (NEW — Revision 7, D-15)**
 
 ```
 Setup:    refreshSession is in-flight (UpdateAsync yielded). disconnectPlayer starts;
-          state→"disconnecting"; sessionTokens[X]=nil.
+          state→"disconnecting". (sessionTokens[X]=T_A preserved — D-20 fix.)
           Refresh UpdateAsync eventually returns.
 Case A:   result._session.token == T_A (refresh committed).
           Result handler: playerState[X] == "disconnecting" ≠ "active" → return false.
@@ -777,12 +782,14 @@ Expected: One save at a time. Final state = snapshot_T1 ≥ snapshot_T0. DESIGN:
 **Scenario SR-2: Autosave attempt while in "disconnecting" state**
 
 ```
-Setup:    disconnectPlayer in progress; state[X]="disconnecting"; sessionTokens[X]=nil.
+Setup:    disconnectPlayer in progress; state[X]="disconnecting"; sessionTokens[X]=T_A (preserved — D-20 fix).
           An autosave coroutine calls savePlayer(X).
 Step 1:   savePlayer: playerState[X] == "disconnecting" ≠ "active" → return false immediately. PASS
-          (token nil check is not reached; state check is first.)
+          (token capture not reached; state check is sufficient.)
 Expected: Autosave rejected before any DataStore call. DESIGN: PASS
-Note:     sessionTokens nil is defence-in-depth only; the state check alone is sufficient.
+Note:     The state guard alone blocks savePlayer in "disconnecting" state. sessionTokens preservation
+          (D-20 fix) is not needed to block autosaves; it serves the §6.3 Step 2 identity check
+          in the drain-timeout path.
 ```
 
 **Scenario SR-3: Both PlayerRemoving and BindToClose call disconnectPlayer**

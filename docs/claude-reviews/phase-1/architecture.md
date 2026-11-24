@@ -1,6 +1,6 @@
-# Phase 1 Architecture — Cash Empire Tycoon (Revision 10)
+# Phase 1 Architecture — Cash Empire Tycoon (Revision 11)
 
-**Date:** 2026-11-24
+**Date:** 2026-11-25
 **Scope:** `PlayerDataManager.lua` session locking design
 **Status:** Revision 10 — pending approval before implementation
 
@@ -504,7 +504,7 @@ return true
 
 **Why `disconnectSave` and not `savePlayer`:**
 
-`savePlayer` reads `sessionTokens[userId]` to get its token and checks for state `"active"`. `disconnectPlayer` clears both before the save is needed: state → `"disconnecting"`, `sessionTokens[userId] = nil`. Calling `savePlayer` after those changes would fail both guards silently, leaving the player's last session data unsaved. `disconnectSave` accepts an explicit `token` and `snapshot` passed from `disconnectPlayer` and checks for `"disconnecting"` state directly, so it is not affected by those cleared values.
+`savePlayer` reads `sessionTokens[userId]` to get its token and checks for state `"active"`. `disconnectPlayer` transitions state to `"disconnecting"` in step 1 and captures `sessionTokens[userId]` as a local variable without clearing it (D-20 fix — `sessionTokens` is preserved for the §6.3 identity check in the drain-timeout path). `savePlayer` is therefore blocked by the state guard (`"disconnecting" ≠ "active"`) alone. `disconnectSave` accepts an explicit `token` and `snapshot` passed from `disconnectPlayer` and checks for `"disconnecting"` state directly, so it is not affected by the state change and does not need to read `sessionTokens[userId]`.
 
 **Session loss during disconnect save:** If `disconnectSave` detects ownership loss, state transitions to `"abandoned"` and `invalidated[userId]` is set. `disconnectPlayer` checks the return value and skips `releaseSession` — there is nothing to release because another server holds the session. The stolen session's TTL countdown is not affected.
 
@@ -638,7 +638,7 @@ When `disconnectPlayer` clears `activeLocks[userId]` (§10.1 step 2), the refres
 
 **Will the in-flight refresh falsely detect ownership loss?**
 
-No — with the fixed callback (§7.1). The callback uses the captured `token` (not live `sessionTokens[userId]`). Even after `disconnectPlayer` clears `sessionTokens[userId] = nil`, the callback still compares `current._session.token ~= T_A` (the captured value). If the session has not been stolen, the comparison succeeds and the refresh completes normally. Only a genuine token mismatch in DataStore (another server holds the session) causes the callback to return nil.
+No — with the fixed callback (§7.1). The callback uses the captured `token` (not live `sessionTokens[userId]`). With the D-20 fix, `disconnectPlayer` does not clear `sessionTokens[userId]` in step 2 — `sessionTokens` is preserved for the §6.3 identity check in the drain-timeout path. Even so, the callback's correctness does not depend on `sessionTokens`: it closes over the captured local `token` from §7.2, which cannot be changed by any external operation. If the session has not been stolen, the comparison succeeds and the refresh completes normally. Only a genuine token mismatch in DataStore (another server holds the session) causes the callback to return nil.
 
 **Will the in-flight refresh overwrite `"disconnecting"` state, or a later "active" session?**
 
@@ -716,7 +716,7 @@ This corresponds to the normal-path timeline from `disconnectPlayer` (§10.4, Ti
 
 ```
 T0  disconnectPlayer starts for X. State="active"→"disconnecting".
-    activeLocks[X]=nil; captured token=T_A; sessionTokens[X]=nil.
+    activeLocks[X]=nil; captured token=T_A. (sessionTokens[X]=T_A preserved — D-20 fix; not cleared until step 7.)
 T1  Drain wait: inFlightSaves[X]==0 → no wait (no autosave in flight). Pass.
 T2  snapshot=deepCopy(loadedData[X]) taken.
     disconnectSave(X, player, T_A, snapshot): inFlightSaves[X]=1; UpdateAsync yields.
