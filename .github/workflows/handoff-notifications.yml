@@ -30,25 +30,39 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ github.token }}
+      # github.token cannot manage repository Actions variables (HTTP 403).
+      # Requires a Fine-Grained PAT with Actions: read+write stored as HANDOFF_TOKEN.
+      GH_TOKEN: ${{ secrets.HANDOFF_TOKEN }}
       REPO: ${{ github.repository }}
     steps:
       - name: Start notifications
         if: inputs.action == 'start'
         run: |
-          gh api \
+          set +e
+          START_OUTPUT=$(gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
             "/repos/${REPO}/actions/variables" \
             -f name='HANDOFF_NOTIFICATIONS_ENABLED' \
             -f value='true' \
-            2>/dev/null \
-          || gh api \
-            --method PATCH \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/${REPO}/actions/variables/HANDOFF_NOTIFICATIONS_ENABLED" \
-            -f value='true'
-          echo "Handoff notifications ENABLED."
+            2>&1)
+          START_EXIT=$?
+          set -e
+          if [ $START_EXIT -eq 0 ]; then
+            echo "Handoff notifications ENABLED (variable created)."
+          elif echo "$START_OUTPUT" | grep -qi '"status":"422"\|"status":"409"\|already exists\|already exist'; then
+            # Variable already exists — update it via PATCH
+            gh api \
+              --method PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${REPO}/actions/variables/HANDOFF_NOTIFICATIONS_ENABLED" \
+              -f value='true'
+            echo "Handoff notifications ENABLED (variable updated)."
+          else
+            echo "ERROR: Failed to create variable." >&2
+            echo "$START_OUTPUT" >&2
+            exit 1
+          fi
 
       - name: Stop notifications
         if: inputs.action == 'stop'
