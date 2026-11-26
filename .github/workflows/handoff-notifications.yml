@@ -141,47 +141,125 @@ jobs:
               throw e;
             }
 
-            const commit  = context.sha;
-            const shortSha = commit.slice(0, 8);
-            const branch  = context.ref.replace('refs/heads/', '');
-            const repoUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}`;
+            const owner     = context.repo.owner;
+            const repo      = context.repo.repo;
+            const commit    = context.sha;
+            const shortSha  = commit.slice(0, 8);
+            const branch    = context.ref.replace('refs/heads/', '');
+            const repoUrl   = `https://github.com/${owner}/${repo}`;
             const commitUrl = `${repoUrl}/commit/${commit}`;
+            const payload   = context.payload;
 
-            // Collect changed handoff files from the push payload.
-            const files = [];
-            const pushPayload = context.payload;
-            if (pushPayload.commits) {
-              for (const c of pushPayload.commits) {
-                for (const f of [...(c.added || []), ...(c.modified || []), ...(c.removed || [])]) {
-                  if (f.startsWith('_project_handoff/') && !files.includes(f)) {
-                    files.push(f);
-                  }
-                }
+            // File detection: use Compare Commits API for a reliable tree diff.
+            // payload.commits[n].added/modified/removed is not used — GitHub push
+            // payloads do not reliably populate these fields.
+            // compareCommits(before, after) returns the complete tree difference
+            // and is not affected by commit ancestry (e.g. merge-commit parents).
+            //
+            // Limit: GitHub Compare API returns at most 300 changed files per
+            // response with no per-file pagination.  If the response reaches that
+            // limit the file list may be incomplete; we fail explicitly rather than
+            // create a notification with a potentially truncated file set.
+            const handoffFiles = new Set();
+            const isInitialPush = payload.before === '0'.repeat(40);
+
+            if (!isInitialPush) {
+              // Normal push: authoritative tree diff.
+              // API failures are not caught — the step fails with a clear error.
+              const { data: cmp } = await github.rest.repos.compareCommits({
+                owner, repo,
+                base: payload.before,
+                head: payload.after,
+              });
+              const allFiles = cmp.files || [];
+              if (allFiles.length >= 300) {
+                throw new Error(
+                  `Compare API returned ${allFiles.length} files (the maximum); ` +
+                  'the file list may be truncated. Cannot determine complete handoff file set.'
+                );
               }
+              for (const f of allFiles) {
+                if (f.filename.startsWith('_project_handoff/'))
+                  handoffFiles.add(f.filename);
+                if ((f.previous_filename || '').startsWith('_project_handoff/'))
+                  handoffFiles.add(f.previous_filename);
+              }
+              core.info(`compareCommits(${payload.before.slice(0,8)}…${shortSha}): ${allFiles.length} total file(s), ${handoffFiles.size} handoff file(s).`);
+            } else {
+              // Initial push: payload.before is the null SHA; Compare API
+              // requires a real commit SHA as base.
+              //
+              // Derive the base from the oldest pushed commit's parent via the
+              // Git Commits API, then run compareCommits(base, after).
+              // payload.commits[n].id (commit SHA) is used only as a pointer —
+              // the file lists on those objects are not read.
+              //
+              // Fails explicitly when no parent exists (true root commit in a
+              // new repository — no comparison base can be derived).
+              if (!payload.commits || payload.commits.length === 0) {
+                throw new Error(
+                  'Initial push: payload.commits is empty; cannot derive a comparison base.'
+                );
+              }
+              const oldestSha = payload.commits[0].id;
+              const { data: oldestCommit } = await github.rest.git.getCommit({
+                owner, repo, commit_sha: oldestSha,
+              });
+              if (!oldestCommit.parents || oldestCommit.parents.length === 0) {
+                throw new Error(
+                  `Initial push to new repository (${oldestSha.slice(0, 8)} has no parent); ` +
+                  'no comparison base exists. Cannot create _project_handoff/ notification.'
+                );
+              }
+              const baseSha = oldestCommit.parents[0].sha;
+              const { data: cmp } = await github.rest.repos.compareCommits({
+                owner, repo,
+                base: baseSha,
+                head: payload.after,
+              });
+              const allFiles = cmp.files || [];
+              if (allFiles.length >= 300) {
+                throw new Error(
+                  `Compare API returned ${allFiles.length} files (the maximum); ` +
+                  'the file list may be truncated. Cannot determine complete handoff file set.'
+                );
+              }
+              for (const f of allFiles) {
+                if (f.filename.startsWith('_project_handoff/'))
+                  handoffFiles.add(f.filename);
+                if ((f.previous_filename || '').startsWith('_project_handoff/'))
+                  handoffFiles.add(f.previous_filename);
+              }
+              core.info(`Initial push compareCommits(${baseSha.slice(0, 8)}…${shortSha}): ${allFiles.length} total file(s), ${handoffFiles.size} handoff file(s).`);
             }
 
-            // Build a deduplicated list; guard against empty (should not occur given
-            // the path filter, but defensive).
+            const files = [...handoffFiles];
             if (files.length === 0) {
               core.info('No _project_handoff/ files in this push; skipping issue creation.');
               return;
             }
 
-            const commitMessage = pushPayload.head_commit
-              ? pushPayload.head_commit.message
+            const commitMessage = payload.head_commit
+              ? payload.head_commit.message
               : '(commit message unavailable)';
 
             const fileList = files.map(f => `- \`${f}\``).join('\n');
 
-            // Duplicate protection: skip if an issue already exists for this commit SHA.
+            // Duplicate protection: search for an existing issue with this
+            // commit SHA in its title.  GitHub Search has an indexing delay of
+            // roughly 60 s; a workflow rerun within that window may still create
+            // a duplicate — this is a known platform limitation.
             const { data: searchResults } = await github.rest.search.issuesAndPullRequests({
-              q: `repo:${context.repo.owner}/${context.repo.repo} is:issue "${shortSha}" in:title`,
+              q: `repo:${owner}/${repo} is:issue "${shortSha}" in:title`,
             });
             if (searchResults.total_count > 0) {
               core.info(`Notification issue for commit ${shortSha} already exists (#${searchResults.items[0].number}). Skipping duplicate.`);
               return;
             }
 
+            // Note: GitHub Issue creation does not guarantee an email
+            // notification.  Email delivery depends on the assignee's GitHub
+            // notification settings.
             const body = [
               `## Handoff Document Update`,
               ``,
@@ -202,9 +280,8 @@ jobs:
             ].join('\n');
 
             await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
+              owner, repo,
               title: `[Handoff Update] ${shortSha} on ${branch}`,
               body,
-              assignees: [context.repo.owner],
+              assignees: [owner],
             });
