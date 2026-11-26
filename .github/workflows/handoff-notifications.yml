@@ -17,9 +17,8 @@ on:
           - status
 
 permissions:
-  actions: write
-  issues: write
-  contents: read
+  contents: write  # manage-control: create/delete the flag file via Contents API
+  issues: write    # notify-handoff: create notification issues
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
@@ -30,37 +29,41 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
-      # github.token cannot manage repository Actions variables (HTTP 403).
-      # Requires a Fine-Grained PAT with Actions: read+write stored as HANDOFF_TOKEN.
-      GH_TOKEN: ${{ secrets.HANDOFF_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
+      FLAG: .github/handoff-enabled
     steps:
       - name: Start notifications
         if: inputs.action == 'start'
         run: |
           set +e
-          START_OUTPUT=$(gh api \
-            --method POST \
+          EXISTING=$(gh api \
             -H "Accept: application/vnd.github+json" \
-            "/repos/${REPO}/actions/variables" \
-            -f name='HANDOFF_NOTIFICATIONS_ENABLED' \
-            -f value='true' \
-            2>&1)
-          START_EXIT=$?
+            "/repos/${REPO}/contents/${FLAG}" 2>&1)
+          EXISTS_EXIT=$?
           set -e
-          if [ $START_EXIT -eq 0 ]; then
-            echo "Handoff notifications ENABLED (variable created)."
-          elif echo "$START_OUTPUT" | grep -qi '"status":"422"\|"status":"409"\|already exists\|already exist'; then
-            # Variable already exists — update it via PATCH
-            gh api \
-              --method PATCH \
+
+          CONTENT=$(printf 'enabled' | base64)
+
+          if [ $EXISTS_EXIT -eq 0 ]; then
+            SHA=$(echo "$EXISTING" | jq -r '.sha')
+            gh api --method PUT \
               -H "Accept: application/vnd.github+json" \
-              "/repos/${REPO}/actions/variables/HANDOFF_NOTIFICATIONS_ENABLED" \
-              -f value='true'
-            echo "Handoff notifications ENABLED (variable updated)."
+              "/repos/${REPO}/contents/${FLAG}" \
+              -f message="chore: enable handoff notifications [skip ci]" \
+              -f content="$CONTENT" \
+              -f sha="$SHA"
+            echo "Handoff notifications ENABLED (flag file updated)."
+          elif echo "$EXISTING" | grep -qi '"status":"404"\|Not Found'; then
+            gh api --method PUT \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${REPO}/contents/${FLAG}" \
+              -f message="chore: enable handoff notifications [skip ci]" \
+              -f content="$CONTENT"
+            echo "Handoff notifications ENABLED (flag file created)."
           else
-            echo "ERROR: Failed to create variable." >&2
-            echo "$START_OUTPUT" >&2
+            echo "ERROR: Unexpected API failure checking flag file." >&2
+            echo "$EXISTING" >&2
             exit 1
           fi
 
@@ -68,20 +71,25 @@ jobs:
         if: inputs.action == 'stop'
         run: |
           set +e
-          STOP_OUTPUT=$(gh api \
-            --method DELETE \
+          EXISTING=$(gh api \
             -H "Accept: application/vnd.github+json" \
-            "/repos/${REPO}/actions/variables/HANDOFF_NOTIFICATIONS_ENABLED" \
-            2>&1)
-          STOP_EXIT=$?
+            "/repos/${REPO}/contents/${FLAG}" 2>&1)
+          EXISTS_EXIT=$?
           set -e
-          if [ $STOP_EXIT -eq 0 ]; then
-            echo "Handoff notifications DISABLED (variable deleted)."
-          elif echo "$STOP_OUTPUT" | grep -qi '"status":"404"\|Not Found'; then
-            echo "Variable did not exist; notifications were already disabled."
+
+          if [ $EXISTS_EXIT -eq 0 ]; then
+            SHA=$(echo "$EXISTING" | jq -r '.sha')
+            gh api --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${REPO}/contents/${FLAG}" \
+              -f message="chore: disable handoff notifications [skip ci]" \
+              -f sha="$SHA"
+            echo "Handoff notifications DISABLED (flag file deleted)."
+          elif echo "$EXISTING" | grep -qi '"status":"404"\|Not Found'; then
+            echo "Flag file not present; notifications were already disabled."
           else
-            echo "ERROR: Unexpected API failure while deleting variable." >&2
-            echo "$STOP_OUTPUT" >&2
+            echo "ERROR: Unexpected API failure checking flag file." >&2
+            echo "$EXISTING" >&2
             exit 1
           fi
 
@@ -89,43 +97,50 @@ jobs:
         if: inputs.action == 'status'
         run: |
           set +e
-          STATUS_OUTPUT=$(gh api \
+          STATUS=$(gh api \
             -H "Accept: application/vnd.github+json" \
-            "/repos/${REPO}/actions/variables/HANDOFF_NOTIFICATIONS_ENABLED" \
-            2>&1)
+            "/repos/${REPO}/contents/${FLAG}" 2>&1)
           STATUS_EXIT=$?
           set -e
+
           if [ $STATUS_EXIT -eq 0 ]; then
-            VALUE=$(echo "$STATUS_OUTPUT" | jq -r '.value // empty')
-            echo "HANDOFF_NOTIFICATIONS_ENABLED: '$VALUE'"
-            if [ "$VALUE" = "true" ]; then
-              echo "Notifications are ENABLED."
-            else
-              echo "Notifications are DISABLED (variable set to non-true value)."
-            fi
-          elif echo "$STATUS_OUTPUT" | grep -qi '"status":"404"\|Not Found'; then
-            echo "HANDOFF_NOTIFICATIONS_ENABLED: not set (notifications DISABLED — variable not configured)"
+            echo "Handoff notifications: ENABLED (.github/handoff-enabled exists)"
+          elif echo "$STATUS" | grep -qi '"status":"404"\|Not Found'; then
+            echo "Handoff notifications: DISABLED (.github/handoff-enabled not present)"
           else
-            echo "ERROR: Failed to query variable. This may be a permissions or network issue." >&2
-            echo "$STATUS_OUTPUT" >&2
+            echo "ERROR: Failed to query flag file." >&2
+            echo "$STATUS" >&2
             exit 1
           fi
 
   # ─────────────────────────────────────────────────────────────────────────────
   # Job 2: Notify on handoff document change
-  # Runs only on push events, and only when the control variable is true.
+  # Runs only on push events. Checks for .github/handoff-enabled before notifying.
   # workflow_dispatch events never reach this job (event_name guard).
   # ─────────────────────────────────────────────────────────────────────────────
   notify-handoff:
-    if: >
-      github.event_name == 'push' &&
-      vars.HANDOFF_NOTIFICATIONS_ENABLED == 'true'
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Create handoff notification issue
         uses: actions/github-script@v7
         with:
           script: |
+            // Check if notifications are enabled (flag file must exist).
+            try {
+              await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                path:  '.github/handoff-enabled',
+              });
+            } catch (e) {
+              if (e.status === 404) {
+                core.info('Notifications disabled (.github/handoff-enabled not found). Skipping.');
+                return;
+              }
+              throw e;
+            }
+
             const commit  = context.sha;
             const shortSha = commit.slice(0, 8);
             const branch  = context.ref.replace('refs/heads/', '');
