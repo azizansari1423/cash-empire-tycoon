@@ -1,9 +1,9 @@
-# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 13)
+# Phase 1 Implementation Report — Cash Empire Tycoon (Revision 14)
 
 **Date:** 2026-11-25
 **Branch:** `feature/phase-1-data-foundation` (commit b05aa20)
 **Review branch:** `claude-review/phase-1`
-**Status:** Revision 13 — pending approval before implementation
+**Status:** Revision 14 — pending approval before implementation
 
 ---
 
@@ -541,6 +541,93 @@ See architecture §6.3, §10.1 step 2, §10.1 step 7, Timelines E/G/H/I/K/L (Rev
 
 ---
 
+### D-21: Terminal state cleanup gap — `playerState` persists after `"failed"` / `"invalidated"` on `PlayerRemoving` (MEDIUM)
+
+**File:** `PlayerDataManager.lua`, `disconnectPlayer`
+
+**Root cause:** `disconnectPlayer` guards its disconnect lifecycle with `if playerState[userId] ~= "active": return`. For the `"failed"` and `"invalidated"` terminal states, this returns immediately without clearing `playerState`. After `PlayerRemoving` fires (triggered by the kick that follows both states), `playerState` remains `"failed"` or `"invalidated"` indefinitely. `loadPlayer` rejects any non-nil state (§5.1 guard), permanently blocking same-server rejoin until server restart.
+
+**Exact lifecycle — "failed" state:**
+
+```
+loadPlayer → all retries exhausted → playerState="failed" → kick
+PlayerRemoving → disconnectPlayer → "failed" ≠ "active" → return (no cleanup)
+playerState stays "failed" forever (session never activated; no async operations)
+```
+
+**Exact lifecycle — "invalidated" state:**
+
+```
+savePlayer §6.3 Step 3 → confirmedSessionLoss while "active" → playerState="invalidated" → kick
+PlayerRemoving → disconnectPlayer → "invalidated" ≠ "active" → return (no cleanup)
+playerState stays "invalidated" forever; in-flight saves still complete (with confirmedSessionLoss)
+```
+
+**Fix:** Add terminal state cleanup in `disconnectPlayer` before the `"active"` guard:
+
+- **`"failed"` path:** Clear `playerState = nil`, `invalidated = nil` immediately (session was never activated; no async operations outstanding). All other tables are nil.
+- **`"invalidated"` path, `inFlightSaves == 0`:** Clear all per-player state tables to nil immediately.
+- **`"invalidated"` path, `inFlightSaves > 0`:** Clear `loadedData`, `invalidated`, `activeLocks`, `lastRefresh` to nil; transition `playerState = "abandoned"`. Deferred cleanup of `sessionTokens`, `inFlightSaves`, `playerState` delegated to `§6.3 Step 4` (same protocol as the drain-timeout path). The remaining in-flight saves will all complete with `confirmedSessionLoss` and write nothing.
+
+**New state transitions added:**
+
+- `"failed" → nil`: on `PlayerRemoving`
+- `"invalidated" → nil` (immediate): on `PlayerRemoving` when `inFlightSaves == 0`
+- `"invalidated" → "abandoned"` (deferred): on `PlayerRemoving` when `inFlightSaves > 0`
+
+See architecture §4, §10.1 terminal state cleanup block, Timelines N, N-B, O (Revision 14).
+
+---
+
+### D-22: Ghost session when `PlayerRemoving` fires during `loadPlayer` yield (MEDIUM)
+
+**File:** `PlayerDataManager.lua`, `loadPlayer`
+
+**Root cause:** If a player connects then disconnects while `loadPlayer`'s `UpdateAsync` call is in progress, `PlayerRemoving` fires when `playerState == "loading"`. `disconnectPlayer` returns immediately (not "active"). `UpdateAsync` subsequently succeeds; `loadPlayer`'s §5.6 activates the session (`playerState → "active"`, `sessionTokens`, `loadedData` populated). The player is gone, but an active session exists in both memory and DataStore. The session blocks other servers for up to `LOCK_TTL` (60 s).
+
+**Exact race sequence:**
+
+```
+1. PlayerAdded → loadPlayer → playerState="loading" → UpdateAsync yields
+2. PlayerRemoving fires → disconnectPlayer: "loading" ≠ "active" → returns (no lifecycle)
+3. UpdateAsync succeeds → loadPlayer §5.6 activates session → playerState="active"
+4. Ghost session: "active" in memory + live token in DataStore, no one to disconnect it
+```
+
+**Fix — §5.6 presence check after confirmed acquisition:**
+
+After the acquisition break and before session activation, check `player.Parent == nil`:
+- If the player has left: perform an inline best-effort release (write `released=true` to DataStore via RELEASE_RETRIES × SAVE_BACKOFF); clear `playerState = nil`; return nil. TTL is the safety net if the release DataStore call fails.
+- If the player is still present: activate the session normally.
+
+**Ordering invariant:**
+1. Acquisition confirmed (break from retry loop)
+2. Presence check (`player.Parent == nil`)
+3. If absent: inline release → `playerState = nil` → `return nil`
+4. If present: build data record → activate session → `return data`
+
+**Caller responsibility — leave-and-rejoin during load:** When `PlayerRemoving` fires during `loadPlayer`, `§5.1` blocks any `PlayerAdded`-triggered second load (playerState="loading"). The second `loadPlayer` returns nil immediately. The `PlayerAdded` handler must detect this case (player present, `loadPlayer` returned nil) and kick the player with a retry message.
+
+**Limitation:** If the inline release fails all retries, the session blocks other servers for `LOCK_TTL` (60 s). This is acceptable: the data is consistent (session was never used), and TTL is the documented safety net.
+
+See architecture §5.1 (D-22 caller responsibility note), §5.6 (presence check pseudocode), Timelines M, M-B (Revision 14).
+
+---
+
+### D-23: Stale `§6.5 disconnectSave` precondition comment (NIT)
+
+**File:** `architecture.md`, `§6.5 disconnectSave` interface pseudocode
+
+**Root cause:** The precondition comment states `"token is the value captured from sessionTokens before it was cleared"`. With the D-20 fix, `sessionTokens[userId]` is explicitly NOT cleared before the disconnect save — it is preserved through `disconnectPlayer` step 2 for the §6.3 Step 2 identity check. The comment implies the pre-D-20 behavior and contradicts the current design.
+
+**Fix:** Updated comment to: `"token is the value captured from sessionTokens[userId] in disconnectPlayer step 2 (sessionTokens[userId] is NOT cleared in step 2 — it is preserved for §6.3 Step-2 identity check; it is cleared in step 7 or by §6.3 Step 4)"`.
+
+No runtime impact. Documentation accuracy only.
+
+See architecture §6.5 (Revision 14).
+
+---
+
 ## Revised Requirements (Revision 10 additions)
 
 | ID | Requirement | Source defect | Architecture section |
@@ -648,3 +735,16 @@ See architecture §6.3, §10.1 step 2, §10.1 step 7, Timelines E/G/H/I/K/L (Rev
 | `disconnectSave` token passed explicitly | Correct — token captured in step 2 (`local token = sessionTokens[userId]`) before sessionTokens is cleared; passed as parameter to disconnectSave and releaseSession. |
 | Cleanup invariant: all tables nil after normal path | Confirmed — step 7 clears all seven tables including sessionTokens (now explicitly preserved until step 7). |
 | Cleanup invariant: drain-timeout path | Confirmed — §6.3 Step 4 now clears sessionTokens, inFlightSaves, playerState; loadedData cleared by disconnectPlayer timeout block; activeLocks cleared in step 2. |
+
+---
+
+## Summary of Changes from Revision 13 (940520c)
+
+| Issue | Revision 13 problem | Revision 14 fix |
+|---|---|---|
+| D-21 — `playerState` persists as `"failed"` or `"invalidated"` after `PlayerRemoving` | `disconnectPlayer` returned immediately for these terminal states without cleanup; `playerState` stayed non-nil permanently, blocking same-server rejoin until server restart | Added terminal state cleanup block in `disconnectPlayer` before the `"active"` guard: `"failed"` → immediate clear; `"invalidated"` → immediate clear if `inFlightSaves==0`, or `→ "abandoned"` if `inFlightSaves>0` (reuses §6.3 Step 4 deferred cleanup protocol) |
+| D-22 — Ghost session when `PlayerRemoving` fires during `loadPlayer` yield | `loadPlayer`'s §5.6 activated the session even if the player left while `UpdateAsync` was in progress; no one would subsequently run disconnect; session blocked other servers for `LOCK_TTL` | Added presence check (`player.Parent == nil`) in §5.6 after confirmed acquisition but before session activation; if absent: inline best-effort release, `playerState = nil`, return nil |
+| D-23 — Stale `§6.5` precondition comment | Comment said "token captured from sessionTokens before it was cleared" — contradicted D-20 fix which preserves `sessionTokens` in step 2 | Updated comment to accurately reflect that `sessionTokens[userId]` is NOT cleared in step 2 and is preserved for §6.3 Step-2 identity check |
+| Risk 1 — `UpdateAsync` nil behavior (was UNRESOLVED) | Described as unresolved platform behavior | RESOLVED by official Roblox documentation: "If the callback returns nil, the write operation is cancelled and the value remains unchanged." Design correctness unaffected; both return-value behaviors handled. |
+| Risk 3 — `GenerateGUID` HTTP premise (was documented risk) | Stated that `HttpService:GenerateGUID` requires HTTP requests enabled in Studio | DOWNGRADED to non-issue: official docs confirm no `Network` capability required; function is a local operation. |
+| BindToClose 30s limit (was undocumented) | 25s deadline explained without reference to Roblox's actual limit | Added confirmed 30s Roblox shutdown window; documented 5s buffer rationale and remaining limitation. |

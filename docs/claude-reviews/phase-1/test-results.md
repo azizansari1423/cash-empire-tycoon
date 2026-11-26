@@ -1,8 +1,8 @@
-# Phase 1 Test Results — Cash Empire Tycoon (Revision 13)
+# Phase 1 Test Results — Cash Empire Tycoon (Revision 14)
 
 **Date:** 2026-11-25
 **Commit under review:** b05aa20 (`feature/phase-1-data-foundation`)
-**Review revision:** 13
+**Review revision:** 14
 **Status:** Test plan revised — runtime tests not yet executed
 
 > **Note:** All test results in this document are design-level analysis. No runtime tests have been executed. Test scenarios marked PASS/FAIL reflect whether the revised design is expected to handle them correctly, not observed runtime behaviour.
@@ -1094,3 +1094,134 @@ The following tests must be executed in Roblox Studio after implementation. None
 | T-16 (manual) | Issue 1 | CR-1, CR-2 |
 | T-17 (manual) | Issue 3 | ML-1 |
 | T-18 (manual) | Issue 2 | DS-3 |
+
+## Tests Added for Revision 14 (D-21, D-22, D-23 and Platform Semantics)
+
+| Test | Issue covered | Scenario reference |
+|---|---|---|
+| Failed load followed by same-server rejoin: `playerState` cleared by terminal cleanup; rejoin succeeds | D-21 — `"failed"` state persists forever | FR-1 (new), Timeline O |
+| Invalidated session, `inFlightSaves==0` at PlayerRemoving: immediate full cleanup; same-server rejoin enabled | D-21 — `"invalidated"` state immediate path | FR-2 (new), Timeline N |
+| Invalidated session, `inFlightSaves>0` at PlayerRemoving: `→ "abandoned"` deferred path; §6.3 Step 4 fires; same-server rejoin enabled | D-21 — `"invalidated"` state deferred path | FR-3 (new), Timeline N-B |
+| Player leaves during loadPlayer yield; presence check prevents ghost "active" session; inline release issued; playerState cleared | D-22 — ghost session on player-left-during-load | PL-1 (new), Timeline M |
+| Player leaves during load and rejoins before old load completes; §5.1 blocks T_B; caller kicks with retry message; T_A releases; next join succeeds | D-22 — leave-and-rejoin during load | PL-2 (new), Timeline M-B |
+| Old load completion after newer session started: T_A's presence check correctly identifies T_A's player object (not T_B); releases correctly | D-22 — `player.Parent` specificity | PL-3 (new) |
+| Old autosave completion after `"invalidated" → "abandoned"` terminal cleanup: §6.3 Step 2 identity check blocks T_A from modifying any state | D-21 deferred path + D-20 §6.3 defence-in-depth | PL-4 (new), Timeline N-B |
+| `§6.5` comment no longer implies `sessionTokens` was cleared before disconnect save | D-23 — stale comment corrected | Comment audit |
+| Risk 1 (`UpdateAsync` nil) confirmed by official docs: write cancelled, value unchanged | Platform semantics — no longer unresolved | §15 Risk 1 (resolved) |
+| Risk 3 (`GenerateGUID` HTTP) confirmed non-issue: local operation, no Network capability | Platform semantics — downgraded | §15 Risk 3 (non-issue) |
+| BindToClose 30s limit confirmed; 25s internal deadline correct with 5s buffer | Platform semantics — documented | §10.3 (updated) |
+
+### Scenario FR-1: Failed load followed by same-server rejoin (D-21)
+
+```
+Setup:    DataStore unavailable; loadPlayer exhausts all LOAD_RETRIES.
+Step 1:   playerState[X]="failed"; invalidated[X]=true; player kicked.
+          (sessionTokens, loadedData, activeLocks, inFlightSaves: all nil)
+Step 2:   PlayerRemoving fires. disconnectPlayer(X): playerState=="failed" → D-21 cleanup.
+          playerState[X]=nil; invalidated[X]=nil. Return.
+Step 3:   DataStore recovers. Player rejoins same server.
+Step 4:   loadPlayer(X): playerState[X]==nil → allowed. ✅
+Expected: playerState cleared by disconnectPlayer terminal cleanup;
+         same-server rejoin enabled. DESIGN: PASS
+```
+
+### Scenario FR-2: Invalidated session, `inFlightSaves==0` at PlayerRemoving (D-21 immediate path)
+
+```
+Setup:    Session stolen while player active; one autosave detected the loss.
+Step 1:   §6.3 Step 3: playerState="invalidated"; player kicked. inFlightSaves[X]=0.
+Step 2:   PlayerRemoving fires. disconnectPlayer(X): playerState=="invalidated".
+          inFlightSaves==0 → immediate full cleanup.
+          All tables → nil. Return.
+Step 3:   Player rejoins same server. loadPlayer(X): playerState==nil → allowed. ✅
+Expected: Immediate terminal cleanup; same-server rejoin enabled. DESIGN: PASS
+```
+
+### Scenario FR-3: Invalidated session, `inFlightSaves>0` at PlayerRemoving (D-21 deferred path)
+
+```
+Setup:    Two autosaves in flight; autosave 1 detects session loss (inFlightSaves still 1 after Step 1).
+Step 1:   §6.3 Step 3: playerState="invalidated"; player kicked.
+Step 2:   PlayerRemoving fires. disconnectPlayer(X): playerState=="invalidated".
+          inFlightSaves[X]==1 > 0 → partial cleanup:
+          loadedData, invalidated, activeLocks, lastRefresh → nil.
+          playerState[X]="abandoned".
+Step 3:   Autosave 2 completes. §6.3 Step 4: playerState=="abandoned" AND inFlightSaves==0
+          → sessionTokens=nil; inFlightSaves=nil; playerState=nil. ✅
+Step 4:   Player rejoins same server. loadPlayer(X): playerState==nil → allowed. ✅
+Expected: Deferred cleanup via §6.3 Step 4; same-server rejoin enabled after last save. DESIGN: PASS
+```
+
+### Scenario PL-1: Player leaves during `loadPlayer` yield; no ghost session (D-22)
+
+```
+Setup:    Player connects; PlayerRemoving fires before UpdateAsync returns.
+Step 1:   loadPlayer: playerState="loading". UpdateAsync yields.
+Step 2:   PlayerRemoving: disconnectPlayer → "loading" ≠ "failed" ≠ "invalidated" ≠ "active" → returns.
+Step 3:   UpdateAsync returns: acquisition confirmed.
+          §5.6 presence check: player.Parent==nil → player has left.
+Step 4:   Inline release: writes _session.released=true to DataStore. playerState=nil.
+          Returns nil to PlayerAdded handler.
+Expected: No ghost "active" session. Session released promptly. playerState cleared. DESIGN: PASS
+Fail indicator: Session remains live in DataStore without released=true; playerState stays "loading".
+```
+
+### Scenario PL-2: Player leaves during load and rejoins same server before old load completes (D-22)
+
+```
+Setup:    T_A's UpdateAsync in progress; T_A leaves; T_B (same userId) joins same server.
+Step 1:   loadPlayer(T_A): playerState="loading". UpdateAsync yields.
+Step 2:   PlayerRemoving for T_A. disconnectPlayer: "loading" → returns.
+Step 3:   PlayerAdded for T_B. loadPlayer(T_B): playerState=="loading" ≠ nil → §5.1 rejects. Returns nil.
+          Caller responsibility: T_B present but loadPlayer returned nil →
+          kick T_B with "Data still loading from previous session. Please wait and rejoin."
+Step 4:   T_A's UpdateAsync returns. §5.6 presence check: T_A's player.Parent==nil → releases session.
+          playerState=nil.
+Step 5:   T_B joins any server on next connection. loadPlayer: playerState==nil → allowed. ✅
+Expected: T_B blocked during T_A's load; kicked with guidance; T_A releases; next join succeeds. DESIGN: PASS
+Caller responsibility: PlayerAdded handler must check if player present when loadPlayer returns nil
+                      and kick with retry message.
+Fail indicator: T_A activates session for absent player (ghost session) OR T_B gets stuck with no data
+               and no guidance to rejoin.
+```
+
+### Scenario PL-3: Old load completion after `player.Parent` already nil; `player.Parent` is object-specific (D-22)
+
+```
+Setup:    T_A left and T_B joined. T_A's UpdateAsync returns after T_B is present.
+          T_A's loadPlayer holds the original T_A player object.
+Step 1:   T_A's UpdateAsync returns: acquisition confirmed.
+Step 2:   §5.6 presence check: T_A.player.Parent==nil (T_A's player object is removed).
+          T_B is a different player object; its presence does not affect T_A's check.
+Step 3:   Inline release issued for T_A's token. playerState=nil. Returns nil.
+          (T_B is blocked anyway by playerState≠nil during this window.)
+Expected: T_A's presence check correctly identifies T_A's player object departure.
+         T_B's presence does not falsely satisfy T_A's check. DESIGN: PASS
+```
+
+### Scenario PL-4: Old autosave completion after `"invalidated" → "abandoned"` cleanup; identity check blocks (D-21 + D-20 defence)
+
+```
+Setup:    Session invalidated (stolen); inFlightSaves[X]=2 at PlayerRemoving.
+          disconnectPlayer terminal cleanup: playerState="abandoned".
+Step 1:   Autosave 2 §6.3 Step 1: inFlightSaves[X] → 1.
+          Step 2: sessionTokens[X]==T_A==capturedToken → identity passes.
+          Step 3: confirmedSessionLoss=true; playerState=="abandoned" (NOT "active") →
+          skip invalidation; log warning.
+          Step 4: inFlightSaves==1 ≠ 0 → skip. (Not the last save.)
+Step 2:   Later autosave 3 (if any), or autosave 2 is the last:
+          Step 4: playerState=="abandoned" AND inFlightSaves==0 → full deferred cleanup. ✅
+Expected: Stale saves after terminal cleanup do not invalidate or kick any player.
+         Deferred cleanup fires when last save completes. DESIGN: PASS
+```
+
+### Manual Test Plan additions (Revision 14)
+
+| # | Test | Setup | Expected | Fail indicator |
+|---|---|---|---|---|
+| T-19 | Failed load followed by same-server rejoin | Disable DataStore; exhaust load retries; re-enable; player rejoins same Studio session | playerState cleared after kick; rejoin loads data normally | Rejoin returns nil with "already loading/loaded" warning; stuck until server restart |
+| T-20 | Invalidated session followed by same-server rejoin | Inject foreign token to DataStore while player active; trigger autosave; deliver kick; player rejoins | playerState cleared (immediate if 0 saves in flight; deferred if >0); rejoin succeeds | playerState stays "invalidated" or "abandoned"; rejoin blocked |
+| T-21 | Player leaves during `loadPlayer` yield | Studio: add artificial delay in `loadPlayer` before UpdateAsync; disconnect player during delay | Presence check detects departure; inline release written; playerState cleared; no "active" session | playerState="active" for absent player; ghost session in DataStore |
+| T-22 | Player leaves during load and rejoins before old load completes | Studio: same as T-21; reconnect before old load returns | T_B kicked with retry message; T_A releases; next T_B join succeeds | T_B gets stuck (no data, no kick); OR T_A activates for wrong player |
+| T-23 | Old load release when DataStore unavailable | Same as T-21 but DataStore down during inline release | Release fails all retries; session expires by TTL (60s); playerState still cleared to nil | playerState stays "loading"; same-server rejoin blocked |
+| T-24 | Old autosave completion after terminal cleanup transition to "abandoned" | Same as FR-3 (two in-flight saves at invalidation); drive autosave 2 to complete after disconnect | §6.3 Step 4 fires; all tables cleared; no invalidation or kick from stale save; rejoin enabled | Stale autosave triggers kick or invalidation of a new session |
