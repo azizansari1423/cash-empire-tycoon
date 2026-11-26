@@ -1,0 +1,181 @@
+name: Handoff Notifications
+
+on:
+  push:
+    paths:
+      - '_project_handoff/**'
+    # all branches
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Control handoff notifications'
+        required: true
+        type: choice
+        options:
+          - start
+          - stop
+          - status
+
+permissions:
+  actions: write
+  issues: write
+  contents: read
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 1: Manual control — start / stop / status
+  # Runs only on workflow_dispatch; never on push.
+  # ─────────────────────────────────────────────────────────────────────────────
+  manage-control:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Start notifications
+        if: inputs.action == 'start'
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/actions/variables" \
+            -f name='HANDOFF_NOTIFICATIONS_ENABLED' \
+            -f value='true' \
+            2>/dev/null \
+          || gh api \
+            --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/actions/variables/HANDOFF_NOTIFICATIONS_ENABLED" \
+            -f value='true'
+          echo "Handoff notifications ENABLED."
+
+      - name: Stop notifications
+        if: inputs.action == 'stop'
+        run: |
+          set +e
+          STOP_OUTPUT=$(gh api \
+            --method DELETE \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/actions/variables/HANDOFF_NOTIFICATIONS_ENABLED" \
+            2>&1)
+          STOP_EXIT=$?
+          set -e
+          if [ $STOP_EXIT -eq 0 ]; then
+            echo "Handoff notifications DISABLED (variable deleted)."
+          elif echo "$STOP_OUTPUT" | grep -qi '"status":"404"\|Not Found'; then
+            echo "Variable did not exist; notifications were already disabled."
+          else
+            echo "ERROR: Unexpected API failure while deleting variable." >&2
+            echo "$STOP_OUTPUT" >&2
+            exit 1
+          fi
+
+      - name: Report status
+        if: inputs.action == 'status'
+        run: |
+          set +e
+          STATUS_OUTPUT=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/actions/variables/HANDOFF_NOTIFICATIONS_ENABLED" \
+            2>&1)
+          STATUS_EXIT=$?
+          set -e
+          if [ $STATUS_EXIT -eq 0 ]; then
+            VALUE=$(echo "$STATUS_OUTPUT" | jq -r '.value // empty')
+            echo "HANDOFF_NOTIFICATIONS_ENABLED: '$VALUE'"
+            if [ "$VALUE" = "true" ]; then
+              echo "Notifications are ENABLED."
+            else
+              echo "Notifications are DISABLED (variable set to non-true value)."
+            fi
+          elif echo "$STATUS_OUTPUT" | grep -qi '"status":"404"\|Not Found'; then
+            echo "HANDOFF_NOTIFICATIONS_ENABLED: not set (notifications DISABLED — variable not configured)"
+          else
+            echo "ERROR: Failed to query variable. This may be a permissions or network issue." >&2
+            echo "$STATUS_OUTPUT" >&2
+            exit 1
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2: Notify on handoff document change
+  # Runs only on push events, and only when the control variable is true.
+  # workflow_dispatch events never reach this job (event_name guard).
+  # ─────────────────────────────────────────────────────────────────────────────
+  notify-handoff:
+    if: >
+      github.event_name == 'push' &&
+      vars.HANDOFF_NOTIFICATIONS_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create handoff notification issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commit  = context.sha;
+            const shortSha = commit.slice(0, 8);
+            const branch  = context.ref.replace('refs/heads/', '');
+            const repoUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}`;
+            const commitUrl = `${repoUrl}/commit/${commit}`;
+
+            // Collect changed handoff files from the push payload.
+            const files = [];
+            const pushPayload = context.payload;
+            if (pushPayload.commits) {
+              for (const c of pushPayload.commits) {
+                for (const f of [...(c.added || []), ...(c.modified || []), ...(c.removed || [])]) {
+                  if (f.startsWith('_project_handoff/') && !files.includes(f)) {
+                    files.push(f);
+                  }
+                }
+              }
+            }
+
+            // Build a deduplicated list; guard against empty (should not occur given
+            // the path filter, but defensive).
+            if (files.length === 0) {
+              core.info('No _project_handoff/ files in this push; skipping issue creation.');
+              return;
+            }
+
+            const commitMessage = pushPayload.head_commit
+              ? pushPayload.head_commit.message
+              : '(commit message unavailable)';
+
+            const fileList = files.map(f => `- \`${f}\``).join('\n');
+
+            // Duplicate protection: skip if an issue already exists for this commit SHA.
+            const { data: searchResults } = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${context.repo.owner}/${context.repo.repo} is:issue "${shortSha}" in:title`,
+            });
+            if (searchResults.total_count > 0) {
+              core.info(`Notification issue for commit ${shortSha} already exists (#${searchResults.items[0].number}). Skipping duplicate.`);
+              return;
+            }
+
+            const body = [
+              `## Handoff Document Update`,
+              ``,
+              `**Branch:** \`${branch}\``,
+              `**Commit:** [\`${shortSha}\`](${commitUrl})`,
+              ``,
+              `### Changed handoff files`,
+              fileList,
+              ``,
+              `### Commit message`,
+              `\`\`\``,
+              commitMessage,
+              `\`\`\``,
+              ``,
+              `---`,
+              `*This issue was created automatically by the handoff-notifications workflow.*`,
+              `*To disable notifications, run the workflow with action: stop.*`,
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `[Handoff Update] ${shortSha} on ${branch}`,
+              body,
+              assignees: [context.repo.owner],
+            });
