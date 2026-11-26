@@ -1,3 +1,7 @@
+# Local environment — never commit secrets
+.env
+.env.*
+
 # Roblox place files
 /Umar.rbxlx
 *.rbxlx.lock
